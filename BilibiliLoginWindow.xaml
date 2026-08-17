@@ -1,0 +1,49 @@
+<Window x:Class="LiveBoard.BilibiliLoginWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="登录 Bilibili"
+        Width="390"
+        Height="500"
+        ResizeMode="NoResize"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
+        FontFamily="pack://application:,,,/Fonts/#MiSans"
+        Loaded="Window_Loaded"
+        Closed="Window_Closed">
+    <Border Background="White" BorderBrush="#D9DAD5" BorderThickness="1" CornerRadius="18">
+        <Grid Margin="22">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="42" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="46" />
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0" MouseLeftButtonDown="Header_OnMouseLeftButtonDown">
+                <StackPanel>
+                    <TextBlock Text="登录 Bilibili" Foreground="{StaticResource InkBrush}" FontSize="17" FontWeight="Medium" />
+                    <TextBlock Text="扫码后使用账号可用的直播画质" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,2,0,0" />
+                </StackPanel>
+                <Button Content="×" Width="28" Height="28" FontSize="18" HorizontalAlignment="Right" VerticalAlignment="Top" Style="{StaticResource CloseIconButton}" Click="Close_OnClick" ToolTip="关闭" />
+            </Grid>
+
+            <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <Border Width="236" Height="236" Background="#F7F8F5" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="14" Padding="12">
+                    <Grid>
+                        <Image x:Name="QrImage" Width="210" Height="210" Stretch="Uniform" />
+                        <TextBlock x:Name="QrLoadingText" Text="正在生成二维码" Foreground="{StaticResource MutedBrush}" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Grid>
+                </Border>
+                <TextBlock x:Name="LoginStatusText" Text="请使用哔哩哔哩客户端扫码" Foreground="{StaticResource InkBrush}" FontSize="12" HorizontalAlignment="Center" Margin="0,16,0,0" />
+                <TextBlock Text="登录信息会加密保存在当前 Windows 用户下" Foreground="{StaticResource MutedBrush}" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
+            </StackPanel>
+
+            <Grid Grid.Row="2" Margin="0,8,0,0">
+                <Button Content="刷新二维码" Style="{StaticResource QuietButton}" Padding="16,8" HorizontalAlignment="Left" Click="RefreshQr_OnClick" />
+                <Button Content="取消" Style="{StaticResource QuietButton}" Padding="18,8" HorizontalAlignment="Right" Click="Close_OnClick" />
+            </Grid>
+        </Grid>
+    </Border>
+</Window>

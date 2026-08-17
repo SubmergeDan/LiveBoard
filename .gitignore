@@ -1,0 +1,16 @@
+# Build outputs
+[Bb]in/
+[Oo]bj/
+dist/
+
+# IDE and user settings
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Logs and temporary files
+*.log
+*.tmp
+
