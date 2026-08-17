@@ -13,7 +13,9 @@ namespace LiveBoard
 {
     public sealed class RecordingSession : IDisposable
     {
+        private const int GracefulStopTimeoutMilliseconds = 60000;
         private readonly object _errorLock = new object();
+        private readonly object _stopLock = new object();
         private string _errorText = string.Empty;
 
         internal RecordingSession(Process process, string streamUrl, string outputPath, int segmentIndex, long maxBytes)
@@ -70,26 +72,38 @@ namespace LiveBoard
             }
         }
 
-        public void Stop()
+        public bool Stop()
         {
-            StopRequested = true;
-            if (Process == null)
-                return;
-            try
+            lock (_stopLock)
             {
-                if (!Process.HasExited)
+                StopRequested = true;
+                if (Process == null)
+                    return true;
+                try
                 {
+                    if (Process.HasExited)
+                        return true;
+
                     if (Process.StartInfo.RedirectStandardInput)
                     {
                         Process.StandardInput.WriteLine("q");
                         Process.StandardInput.Flush();
                     }
-                    if (!Process.WaitForExit(5000))
-                        Process.Kill();
+
+                    // FFmpeg writes the MP4 trailer only after it receives "q". Do not
+                    // terminate it during that write, otherwise the file has no moov atom.
+                    if (Process.WaitForExit(GracefulStopTimeoutMilliseconds))
+                    {
+                        Process.WaitForExit();
+                        return true;
+                    }
                 }
-            }
-            catch
-            {
+                catch
+                {
+                    if (Process.HasExited)
+                        return true;
+                }
+
                 try
                 {
                     if (!Process.HasExited)
@@ -98,6 +112,7 @@ namespace LiveBoard
                 catch
                 {
                 }
+                return false;
             }
         }
 
@@ -484,8 +499,6 @@ namespace LiveBoard
                     args += " -f flv";
                 else if (extension == "ts")
                     args += " -f mpegts";
-                else
-                    args += " -movflags +faststart";
             }
             else if (extension == "flv")
             {
@@ -494,10 +507,6 @@ namespace LiveBoard
             else if (extension == "ts")
             {
                 args += " -f mpegts";
-            }
-            else
-            {
-                args += " -movflags +faststart";
             }
             return args + " \"" + outputPath + "\"";
         }

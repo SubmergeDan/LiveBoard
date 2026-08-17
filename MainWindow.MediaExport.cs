@@ -19,6 +19,7 @@ namespace LiveBoard
         private MediaAnalysisResult _mediaAnalysis;
         private bool _mediaUrlPlaceholder = true;
         private bool _mediaProxyPlaceholder = true;
+        private double _mediaProgressFloor;
 
         private void InitializeMediaWorkspace()
         {
@@ -48,7 +49,7 @@ namespace LiveBoard
             }
             else
             {
-                MediaProxyBox.Text = "代理地址（可选）";
+                MediaProxyBox.Text = "代理地址（可选，留空使用系统代理）";
                 MediaProxyBox.Foreground = FindBrush("MutedBrush");
                 _mediaProxyPlaceholder = true;
             }
@@ -70,7 +71,7 @@ namespace LiveBoard
             var input = _mediaUrlPlaceholder ? string.Empty : MediaUrlBox.Text;
             if (string.IsNullOrWhiteSpace(MediaExportService.ExtractUrl(input)))
             {
-                SetMediaStatus("请输入有效的媒体地址", "支持抖音、快手、B站、X 与 Instagram", "需要地址", "!", FindBrush("OrangeBrush"));
+                SetMediaStatus("请输入有效的网页地址", "支持公开视频网页与常见媒体链接", "需要地址", "!", FindBrush("OrangeBrush"));
                 MediaUrlBox.Focus();
                 return;
             }
@@ -88,7 +89,7 @@ namespace LiveBoard
             var cancellation = new CancellationTokenSource();
             _mediaCancellation = cancellation;
             SetMediaBusy(true, "解析中");
-            SetMediaStatus("正在解析媒体", "正在读取平台返回的可用资源", "解析中", "…", FindBrush("BrightGreenBrush"));
+            SetMediaStatus("正在解析媒体", "正在识别网页中可导出的媒体资源", "解析中", "…", FindBrush("BrightGreenBrush"));
 
             try
             {
@@ -172,6 +173,7 @@ namespace LiveBoard
             var format = MediaQualityCombo.SelectedItem as MediaFormatOption;
             var cancellation = new CancellationTokenSource();
             _mediaCancellation = cancellation;
+            _mediaProgressFloor = 0;
             SetMediaBusy(true, "导出中");
                 SetMediaStatus("正在导出媒体", _mediaAnalysis.Title, "导出中", "…", FindBrush("BrightGreenBrush"));
             try
@@ -261,7 +263,7 @@ namespace LiveBoard
         {
             if (!string.IsNullOrWhiteSpace(MediaUrlBox.Text))
                 return;
-            MediaUrlBox.Text = "粘贴抖音、快手、B站、X 或 Instagram 分享地址";
+            MediaUrlBox.Text = "粘贴任意公开网页或媒体地址";
             MediaUrlBox.Foreground = FindBrush("MutedBrush");
             _mediaUrlPlaceholder = true;
         }
@@ -282,7 +284,7 @@ namespace LiveBoard
                 SaveConfig(null);
                 return;
             }
-            MediaProxyBox.Text = "代理地址（可选）";
+            MediaProxyBox.Text = "代理地址（可选，留空使用系统代理）";
             MediaProxyBox.Foreground = FindBrush("MutedBrush");
             _mediaProxyPlaceholder = true;
             SaveConfig(null);
@@ -394,16 +396,45 @@ namespace LiveBoard
 
         private void SetMediaProgress(double percent, string speed, string eta)
         {
+            var normalizedPercent = Math.Max(0, Math.Min(99.9, percent));
+            _mediaProgressFloor = Math.Max(_mediaProgressFloor, normalizedPercent);
             MediaProgressBar.IsIndeterminate = false;
             MediaProgressBar.Visibility = Visibility.Visible;
-            MediaProgressBar.Value = Math.Max(0, Math.Min(100, percent));
-            MediaProgressText.Text = percent.ToString("0.#", CultureInfo.InvariantCulture) + "%";
+            MediaProgressBar.Value = _mediaProgressFloor;
+            MediaProgressText.Text = _mediaProgressFloor.ToString("0.#", CultureInfo.InvariantCulture) + "%";
             MediaTaskStateText.Text = MediaProgressText.Text;
-            var detail = new[] { speed, string.IsNullOrWhiteSpace(eta) ? null : "剩余 " + eta }
+            var detail = new[] { NormalizeMediaSpeed(speed), NormalizeMediaEta(eta) }
                 .Where(part => !string.IsNullOrWhiteSpace(part))
                 .ToArray();
-            if (detail.Length > 0)
-                MediaStatusDetailText.Text = string.Join(" · ", detail);
+            MediaStatusDetailText.Text = detail.Length > 0 ? string.Join(" · ", detail) : "正在接收媒体数据";
+        }
+
+        private static string NormalizeMediaSpeed(string value)
+        {
+            value = (value ?? string.Empty).Trim();
+            if (value.Length == 0 || value.Equals("NA", StringComparison.OrdinalIgnoreCase) || value.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
+                return null;
+            return value;
+        }
+
+        private static string NormalizeMediaEta(string value)
+        {
+            value = (value ?? string.Empty).Trim();
+            if (value.Length == 0 || value.Equals("NA", StringComparison.OrdinalIgnoreCase) || value.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            double seconds;
+            if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out seconds))
+            {
+                if (seconds < 0 || seconds > TimeSpan.FromDays(1).TotalSeconds)
+                    return null;
+                var remaining = TimeSpan.FromSeconds(seconds);
+                return "剩余 " + (remaining.TotalHours >= 1 ? remaining.ToString(@"hh\:mm\:ss") : remaining.ToString(@"mm\:ss"));
+            }
+
+            if (!Regex.IsMatch(value, @"^\d{1,2}:\d{2}(?::\d{2})?$") || value.StartsWith("24:", StringComparison.Ordinal))
+                return null;
+            return "剩余 " + value;
         }
 
         private static bool TryReadMediaProgress(string value, out double percent, out string speed, out string eta)

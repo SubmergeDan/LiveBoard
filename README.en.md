@@ -9,7 +9,7 @@ LiveBoard is a Windows desktop application for live-stream recording and media e
 - Monitor and record Douyin and Bilibili live rooms.
 - Manage multiple rooms with automatic recording, periodic checks, quality selection, and segment settings.
 - Sign in to Bilibili with a QR code and remux local M4S audio/video without re-encoding.
-- Export public media links from Douyin, Kuaishou, Bilibili, X, and Instagram.
+- Export public media links from Douyin, Kuaishou, Bilibili, X, Instagram, and websites supported by yt-dlp. For ordinary pages, LiveBoard also scans for multiple directly accessible MP4, HLS, DASH, FLV, WebM, or MOV media streams.
 - Bundle FFmpeg, yt-dlp, gallery-dl, and QRCoder. Required tools are extracted to a local cache at runtime.
 
 ## Requirements
@@ -46,7 +46,7 @@ The default output is `bin\Release\LiveBoard.exe`. If MSBuild cannot find the `.
 
 1. In **Live Recording**, enter a room ID or live URL, add it to the queue, then start monitoring or recording.
 2. In **Bilibili Cache Export**, choose local M4S video and audio files to remux them without re-encoding.
-3. In **Media Export**, paste a public sharing URL, wait for analysis, choose an output folder, and export.
+3. In **Media Export**, paste a public webpage or media URL. The analysis lists detected media; ordinary-page scanning only handles directly accessible streams in the page source, not DRM-protected, login-restricted, or dynamically protected video.
 
 Douyin, Bilibili, and other platforms may restrict access because of login state, region, anti-abuse controls, or API changes. Export only content that you are authorized to access and keep.
 
@@ -74,4 +74,3 @@ Tools/        FFmpeg, yt-dlp, and gallery-dl embedded in the EXE
 This project is released under the [GNU GPL v3.0 or later](LICENSE). GPL-3.0-or-later is used because the distributed package embeds an FFmpeg build configured with GPLv3 components.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party components, their licenses, and upstream source locations.
-

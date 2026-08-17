@@ -87,9 +87,12 @@ namespace LiveBoard
     {
         private const string YtDlpResource = "LiveBoard.Resources.yt-dlp.exe";
         private const string GalleryDlpResource = "LiveBoard.Resources.gallery-dl.exe";
+        private const int MaxPageMediaAssets = 100;
         private static readonly object ToolLock = new object();
         private static readonly Regex UrlRegex = new Regex(@"https?://[^\s\]\)>]+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex KuaishouUrlRegex = new Regex(@"https?(?::|\\u003[aA])(?:(?:\\/)|(?:\\u002[fF])){2}(?:[^\s\""'<>\\]|\\.)+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex GenericMediaUrlRegex = new Regex(@"(?<url>(?:https?:)?//[^\""'\s<>\\]+?\.(?:mp4|m3u8|mpd|flv|webm|mov)(?:\?[^\""'\s<>\\]*)?)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex VideoSourceRegex = new Regex(@"<(?:video|source)\b[^>]*\b(?:src|data-src)\s*=\s*(?:\""(?<url>[^\""\r\n]+)\""|'(?<url>[^'\r\n]+)'|(?<url>[^\s>]+))", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private readonly JavaScriptSerializer _serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
         public async Task<MediaAnalysisResult> AnalyzeAsync(string input, string cookieBrowser, string proxy, string bilibiliCookies, CancellationToken cancellationToken, Action<string> progress)
@@ -97,40 +100,51 @@ namespace LiveBoard
             var url = ExtractUrl(input);
             if (string.IsNullOrWhiteSpace(url))
                 return Failure(null, "没有识别到有效的网址。");
+            var effectiveProxy = ResolveProxy(proxy, url);
 
-            var platform = DetectPlatform(url);
-            if (platform == null)
-                return Failure(url, "暂不支持这个网址，请使用抖音、快手、B站、X 或 Instagram 的公开分享地址。");
+            var platform = DetectPlatform(url) ?? "网页";
 
             if (string.Equals(platform, "抖音", StringComparison.OrdinalIgnoreCase))
-                url = await NormalizeDouyinUrlAsync(url, proxy, cancellationToken, progress);
+                url = await NormalizeDouyinUrlAsync(url, effectiveProxy, cancellationToken, progress);
 
             string cookiePath = null;
             try
             {
                 cookiePath = CreateCookieFile(bilibiliCookies, platform == "Bilibili");
                 if (platform == "快手")
-                    return await AnalyzeKuaishouAsync(url, proxy, cancellationToken, progress);
+                    return await AnalyzeKuaishouAsync(url, effectiveProxy, cancellationToken, progress);
                 if (platform == "X" || platform == "Instagram")
                 {
                     ReportProgress(progress, "正在读取帖子媒体");
-                    var gallery = await AnalyzeGalleryAsync(url, platform, cookieBrowser, proxy, cancellationToken, progress);
+                    var gallery = await AnalyzeGalleryAsync(url, platform, cookieBrowser, effectiveProxy, cancellationToken, progress);
                     if (gallery.Success && gallery.AssetCount > 0)
                     {
                         if (gallery.AssetCount == 1 && IsVideo(gallery.Assets[0]))
                         {
-                            var video = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, proxy, cookiePath, cancellationToken, progress);
+                            var video = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
                             if (video.Success)
                                 return video;
                         }
                         return gallery;
                     }
 
-                    var fallback = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, proxy, cookiePath, cancellationToken, progress);
+                    var fallback = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
                     return fallback.Success ? fallback : Failure(url, CombineErrors(gallery.ErrorText, fallback.ErrorText));
                 }
 
-                return await AnalyzeYtDlpAsync(url, platform, cookieBrowser, proxy, cookiePath, cancellationToken, progress);
+                if (string.Equals(platform, "网页", StringComparison.OrdinalIgnoreCase))
+                {
+                    var page = await AnalyzeGenericWebPageAsync(url, effectiveProxy, cancellationToken, progress);
+                    if (page.Success && page.AssetCount > 1)
+                        return page;
+
+                    var ytDlp = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
+                    if (ytDlp.Success)
+                        return ytDlp;
+                    return page.Success ? page : Failure(url, CombineErrors(ytDlp.ErrorText, page.ErrorText));
+                }
+
+                return await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
             }
             catch (OperationCanceledException)
             {
@@ -157,6 +171,7 @@ namespace LiveBoard
             string cookiePath = null;
             try
             {
+                var effectiveProxy = ResolveProxy(proxy, GetDownloadUrl(analysis));
                 cookiePath = CreateCookieFile(bilibiliCookies, string.Equals(analysis.Platform, "Bilibili", StringComparison.OrdinalIgnoreCase));
                 var before = SafeFileCount(outputDirectory);
                 MediaToolResult run;
@@ -169,7 +184,7 @@ namespace LiveBoard
                         "--range", "1-1000", "--directory", outputDirectory
                     };
                     AddCookieArguments(arguments, cookieBrowser, cookiePath);
-                    AddProxyArgument(arguments, proxy);
+                    AddProxyArgument(arguments, effectiveProxy);
                     arguments.Add(GetDownloadUrl(analysis));
                     ReportProgress(progress, "正在下载帖子媒体");
                     run = await RunToolAsync(galleryPath, arguments, cancellationToken, progress);
@@ -180,20 +195,24 @@ namespace LiveBoard
                     var ffmpegPath = RecordingService.EnsureBundledFfmpeg();
                     var arguments = new List<string>
                     {
-                        "--ignore-config", "--no-warnings", "--no-playlist", "--no-colors", "--newline",
+                        "--ignore-config", "--no-warnings", "--playlist-end", MaxPageMediaAssets.ToString(CultureInfo.InvariantCulture), "--no-colors", "--newline",
                         "--encoding", "utf-8", "--socket-timeout", "30", "--ffmpeg-location", Path.GetDirectoryName(ffmpegPath),
                         "--no-mtime", "--no-overwrites", "--merge-output-format", "mp4",
                         "--progress", "--progress-delta", "0.2",
                         "--progress-template", "download:__RH_PROGRESS__%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
                         "--print", "after_move:__RH_OUTPUT__%(filepath)s", "-P", outputDirectory,
-                        "-o", "%(title).160B_%(id)s.%(ext)s"
+                        "-o", "%(autonumber)03d_%(title).160B_%(id)s.%(ext)s"
                     };
                     AddCookieArguments(arguments, cookieBrowser, cookiePath);
-                    AddProxyArgument(arguments, proxy);
-                    var selector = format == null || string.IsNullOrWhiteSpace(format.Selector) ? "bestvideo+bestaudio/best" : format.Selector;
-                    arguments.Add("-f");
-                    arguments.Add(selector);
-                    arguments.Add(GetDownloadUrl(analysis));
+                    AddProxyArgument(arguments, effectiveProxy);
+                    if (!string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var selector = format == null || string.IsNullOrWhiteSpace(format.Selector) ? "bestvideo+bestaudio/best" : format.Selector;
+                        arguments.Add("-f");
+                        arguments.Add(selector);
+                    }
+                    foreach (var downloadUrl in GetDownloadUrls(analysis))
+                        arguments.Add(downloadUrl);
                     ReportProgress(progress, "正在下载视频");
                     run = await RunToolAsync(ytPath, arguments, cancellationToken, progress);
                 }
@@ -315,7 +334,7 @@ namespace LiveBoard
                 var path = EnsureYtDlp();
                 var arguments = new List<string>
                 {
-                    "--ignore-config", "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", "--no-colors",
+                    "--ignore-config", "--dump-single-json", "--skip-download", "--no-warnings", "--playlist-end", MaxPageMediaAssets.ToString(CultureInfo.InvariantCulture), "--no-colors",
                     "--encoding", "utf-8", "--socket-timeout", "30"
                 };
                 AddCookieArguments(arguments, cookieBrowser, cookiePath);
@@ -331,27 +350,33 @@ namespace LiveBoard
                 var root = _serializer.DeserializeObject(run.StandardOutput) as Dictionary<string, object>;
                 if (root == null)
                     return Failure(url, MapError(run.StandardError, platform));
+                var entries = AsEnumerable(GetValue(root, "entries"))
+                    .Select(value => value as Dictionary<string, object>)
+                    .Where(value => value != null)
+                    .Take(MaxPageMediaAssets)
+                    .ToList();
+                var primary = entries.FirstOrDefault() ?? root;
                 var result = new MediaAnalysisResult
                 {
                     Success = true,
                     Platform = platform,
                     Url = url,
                     Engine = "yt-dlp",
-                    Title = FirstString(root, "title", "fulltitle", "id")
+                    Title = FirstString(root, "title", "fulltitle") ?? FirstString(primary, "title", "fulltitle", "id")
                 };
-                var asset = new MediaAssetInfo
+                if (entries.Count == 0)
                 {
-                    Index = 1,
-                    Type = "视频",
-                    Extension = FirstString(root, "ext") ?? "mp4",
-                    Width = GetInt(root, "width"),
-                    Height = GetInt(root, "height")
-                };
-                result.Assets.Add(asset);
-                result.AssetCount = 1;
-                BuildFormatOptions(root, result.Formats);
-                if (result.Formats.Count == 0)
-                    result.Formats.Add(new MediaFormatOption { FormatId = "best", Selector = "bestvideo+bestaudio/best", Label = "最佳可用画质" });
+                    result.Assets.Add(CreateYtDlpAsset(root, 1));
+                    BuildFormatOptions(root, result.Formats);
+                    if (result.Formats.Count == 0)
+                        result.Formats.Add(new MediaFormatOption { FormatId = "best", Selector = "bestvideo+bestaudio/best", Label = "最佳可用画质" });
+                }
+                else
+                {
+                    for (var index = 0; index < entries.Count; index++)
+                        result.Assets.Add(CreateYtDlpAsset(entries[index], index + 1));
+                }
+                result.AssetCount = result.Assets.Count;
                 return result;
             }
             catch (OperationCanceledException)
@@ -362,6 +387,172 @@ namespace LiveBoard
             {
                 return Failure(url, MapError(ex.Message, platform));
             }
+        }
+
+        private static MediaAssetInfo CreateYtDlpAsset(Dictionary<string, object> values, int index)
+        {
+            return new MediaAssetInfo
+            {
+                Index = index,
+                Type = "视频",
+                Extension = FirstString(values, "ext") ?? "mp4",
+                Url = FirstString(values, "webpage_url", "original_url"),
+                Width = GetInt(values, "width"),
+                Height = GetInt(values, "height")
+            };
+        }
+
+        private async Task<MediaAnalysisResult> AnalyzeGenericWebPageAsync(string url, string proxy, CancellationToken cancellationToken, Action<string> progress)
+        {
+            ReportProgress(progress, "正在扫描网页中的媒体资源");
+            try
+            {
+                using (var handler = new HttpClientHandler { AllowAutoRedirect = true })
+                {
+                    if (!string.IsNullOrWhiteSpace(proxy))
+                    {
+                        handler.Proxy = new WebProxy(proxy.Trim());
+                        handler.UseProxy = true;
+                    }
+                    using (var client = new HttpClient(handler))
+                    {
+                        client.Timeout = TimeSpan.FromSeconds(30);
+                        client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36");
+                        client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+                        using (var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                        {
+                            response.EnsureSuccessStatusCode();
+                            var html = await ReadPageTextAsync(response.Content, cancellationToken);
+                            var baseUri = response.RequestMessage == null ? new Uri(url) : response.RequestMessage.RequestUri;
+                            var mediaUrls = ExtractGenericMediaUrls(html, baseUri);
+                            if (mediaUrls.Count == 0)
+                                return Failure(url, "网页未包含可直接导出的媒体流；动态加载、登录限制或 DRM 加密的视频无法通过网页源码提取。");
+
+                            var title = ExtractOpenGraphValue(html, "og:title");
+                            if (string.IsNullOrWhiteSpace(title))
+                            {
+                                var titleMatch = Regex.Match(html, @"<title[^>]*>(?<value>[\s\S]{1,500}?)</title>", RegexOptions.IgnoreCase);
+                                title = titleMatch.Success ? WebUtility.HtmlDecode(titleMatch.Groups["value"].Value).Trim() : null;
+                            }
+                            if (string.IsNullOrWhiteSpace(title))
+                                title = baseUri.Host + " 网页媒体";
+
+                            var result = new MediaAnalysisResult
+                            {
+                                Success = true,
+                                Platform = "网页",
+                                Url = url,
+                                Engine = "direct",
+                                Title = title.Replace("\r", " ").Replace("\n", " ").Trim()
+                            };
+                            for (var index = 0; index < mediaUrls.Count; index++)
+                            {
+                                var extension = ExtensionFromUrl(mediaUrls[index]);
+                                if (string.Equals(extension, "m3u8", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "mpd", StringComparison.OrdinalIgnoreCase))
+                                    extension = "mp4";
+                                result.Assets.Add(new MediaAssetInfo
+                                {
+                                    Index = index + 1,
+                                    Type = "视频",
+                                    Extension = string.IsNullOrWhiteSpace(extension) ? "媒体流" : extension.ToLowerInvariant(),
+                                    Url = mediaUrls[index]
+                                });
+                            }
+                            result.AssetCount = result.Assets.Count;
+                            return result;
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return Failure(url, MapError(ex.Message, "网页"));
+            }
+        }
+
+        private static async Task<string> ReadPageTextAsync(HttpContent content, CancellationToken cancellationToken)
+        {
+            const int maximumBytes = 8 * 1024 * 1024;
+            if (content == null)
+                return string.Empty;
+            if (content.Headers.ContentLength.HasValue && content.Headers.ContentLength.Value > maximumBytes)
+                throw new InvalidDataException("网页内容过大，无法安全扫描媒体地址。");
+
+            using (var input = await content.ReadAsStreamAsync())
+            using (var output = new MemoryStream())
+            {
+                var buffer = new byte[81920];
+                while (true)
+                {
+                    var read = await input.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                    if (read == 0)
+                        break;
+                    if (output.Length + read > maximumBytes)
+                        throw new InvalidDataException("网页内容过大，无法安全扫描媒体地址。");
+                    output.Write(buffer, 0, read);
+                }
+                var charset = content.Headers.ContentType == null ? null : content.Headers.ContentType.CharSet;
+                Encoding encoding;
+                try { encoding = string.IsNullOrWhiteSpace(charset) ? Encoding.UTF8 : Encoding.GetEncoding(charset.Trim('\"')); }
+                catch { encoding = Encoding.UTF8; }
+                return encoding.GetString(output.ToArray());
+            }
+        }
+
+        private static List<string> ExtractGenericMediaUrls(string html, Uri baseUri)
+        {
+            var urls = new List<string>();
+            var knownUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Action<string, bool> add = delegate(string candidate, bool allowUnqualified)
+            {
+                var value = DecodeGenericMediaUrl(candidate);
+                if (string.IsNullOrWhiteSpace(value))
+                    return;
+                Uri mediaUri;
+                if (!Uri.TryCreate(baseUri, value, out mediaUri) ||
+                    (mediaUri.Scheme != Uri.UriSchemeHttp && mediaUri.Scheme != Uri.UriSchemeHttps) ||
+                    (!allowUnqualified && !IsGenericVideoUrl(mediaUri)))
+                    return;
+                var normalized = mediaUri.AbsoluteUri;
+                if (knownUrls.Add(normalized))
+                    urls.Add(normalized);
+            };
+
+            foreach (var property in new[] { "og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream" })
+                add(ExtractOpenGraphValue(html, property), true);
+            foreach (Match match in VideoSourceRegex.Matches(html ?? string.Empty))
+                add(match.Groups["url"].Value, true);
+            var decoded = DecodeGenericMediaUrl(html);
+            foreach (Match match in GenericMediaUrlRegex.Matches(decoded ?? string.Empty))
+                add(match.Groups["url"].Value, false);
+            return urls.Take(MaxPageMediaAssets).ToList();
+        }
+
+        private static string DecodeGenericMediaUrl(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+            value = WebUtility.HtmlDecode(value).Replace("\\/", "/");
+            value = Regex.Replace(value, @"\\u(?<code>[0-9a-fA-F]{4})", delegate(Match match)
+            {
+                return ((char)Convert.ToInt32(match.Groups["code"].Value, 16)).ToString();
+            });
+            return value.Trim().Trim('\"', '\'', '\\');
+        }
+
+        private static bool IsGenericVideoUrl(Uri uri)
+        {
+            var extension = ExtensionFromUrl(uri.AbsolutePath);
+            return string.Equals(extension, "mp4", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(extension, "m3u8", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(extension, "mpd", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(extension, "flv", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(extension, "webm", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(extension, "mov", StringComparison.OrdinalIgnoreCase);
         }
 
         private async Task<MediaAnalysisResult> AnalyzeKuaishouAsync(string url, string proxy, CancellationToken cancellationToken, Action<string> progress)
@@ -726,6 +917,27 @@ namespace LiveBoard
             }
         }
 
+        private static string ResolveProxy(string configuredProxy, string targetUrl)
+        {
+            if (!string.IsNullOrWhiteSpace(configuredProxy))
+                return configuredProxy.Trim();
+            Uri target;
+            if (!Uri.TryCreate(targetUrl, UriKind.Absolute, out target))
+                return null;
+            try
+            {
+                var systemProxy = WebRequest.GetSystemWebProxy();
+                var proxy = systemProxy == null ? null : systemProxy.GetProxy(target);
+                if (proxy == null || Uri.Compare(proxy, target, UriComponents.SchemeAndServer, UriFormat.Unescaped, StringComparison.OrdinalIgnoreCase) == 0)
+                    return null;
+                return proxy.AbsoluteUri;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         private static string BrowserValue(string browser)
         {
             if (string.Equals(browser, "Microsoft Edge", StringComparison.OrdinalIgnoreCase)) return "edge";
@@ -783,6 +995,22 @@ namespace LiveBoard
             if (analysis != null && string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase) && analysis.Assets.Count > 0 && !string.IsNullOrWhiteSpace(analysis.Assets[0].Url))
                 return analysis.Assets[0].Url;
             return analysis == null ? null : analysis.Url;
+        }
+
+        private static IEnumerable<string> GetDownloadUrls(MediaAnalysisResult analysis)
+        {
+            if (analysis == null)
+                return Enumerable.Empty<string>();
+            if (string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase))
+            {
+                return analysis.Assets
+                    .Where(asset => asset != null && !string.IsNullOrWhiteSpace(asset.Url))
+                    .Select(asset => asset.Url)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(MaxPageMediaAssets)
+                    .ToList();
+            }
+            return string.IsNullOrWhiteSpace(analysis.Url) ? Enumerable.Empty<string>() : new[] { analysis.Url };
         }
 
         private static string ExtractKuaishouMediaUrl(string html)
@@ -849,7 +1077,7 @@ namespace LiveBoard
 
         private static bool IsVideoExtension(string extension)
         {
-            return string.Equals(extension, "mp4", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "webm", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "mov", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "m3u8", StringComparison.OrdinalIgnoreCase);
+            return string.Equals(extension, "mp4", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "webm", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "mov", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "m3u8", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "mpd", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "flv", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string ExtensionFromUrl(string url)

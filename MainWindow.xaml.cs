@@ -105,6 +105,10 @@ namespace LiveBoard
         private async void Window_Loaded(object sender, RoutedEventArgs e)
         {
             _config = _store.Load();
+            if (_store.LoadedFromBackup)
+                AddActivity("已恢复直播间配置", "主配置为空或不可读取，已自动恢复上一份备份");
+            else if (_store.LoadedFromLegacyLocation)
+                AddActivity("已迁移直播间配置", "已从旧版 RecordingHelper 配置恢复");
             _bilibili.LoadProtectedCookies(_config.BilibiliCookieData);
             LoadMediaWorkspaceSettings();
             ReplaceRooms(_config.Rooms);
@@ -129,7 +133,6 @@ namespace LiveBoard
             UpdateBilibiliAccountUi();
             RefreshAddQualityOptions(_config.DefaultQuality);
             RefreshAllRoomQualityOptions(false);
-            SaveConfig(null);
             await CheckAllRoomsAsync();
         }
 
@@ -320,7 +323,7 @@ namespace LiveBoard
             }
             RefreshRoomCards();
             AddActivity("已移除直播间", room.DisplayName + " · 配置仍可通过导出文件恢复");
-            SaveConfig("已保存当前队列");
+            SaveConfig("已保存当前队列", Rooms.Count == 0);
         }
 
         private void RoomCard_OnClick(object sender, MouseButtonEventArgs e)
@@ -716,8 +719,20 @@ namespace LiveBoard
             if (_recordingSessions.TryGetValue(room, out session))
             {
                 _recordingSessions.Remove(room);
-                session.Stop();
+                room.RecordingStatus = "正在封装 MP4";
+                UpdateSelectedRoomStatus();
+                RefreshRoomCards();
+                UpdateTasks();
+                var finalized = session.Stop();
                 session.Dispose();
+                if (finalized)
+                {
+                    AddActivity("录制文件已封装", Path.GetFileName(session.OutputPath));
+                }
+                else
+                {
+                    AddActivity("录制停止超时", "FFmpeg 未能正常写完文件尾部，已强制停止：" + Path.GetFileName(session.OutputPath));
+                }
             }
             _recordingStarting.Remove(room);
             _recordingReconnectAttempts.Remove(room);
@@ -1195,7 +1210,7 @@ namespace LiveBoard
                 UpdateBilibiliAccountUi();
                 RefreshAddQualityOptions(imported.DefaultQuality);
                 RefreshAllRoomQualityOptions(false);
-                SaveConfig("已导入直播间配置");
+                SaveConfig("已导入直播间配置", Rooms.Count == 0);
                 AddActivity("已导入配置", Path.GetFileName(dialog.FileName) + " · " + Rooms.Count + " 个直播间");
                 RunStatusCheckAsync();
             }
@@ -1362,7 +1377,6 @@ namespace LiveBoard
             UpdateBilibiliAccountUi();
             RefreshAddQualityOptions(_config.DefaultQuality);
             RefreshAllRoomQualityOptions(false);
-            SaveConfig(null);
             AddActivity("已重新载入配置", "已恢复 " + Rooms.Count + " 个直播间");
             LastSavedText.Text = " · 已从本机恢复";
             RunStatusCheckAsync();
@@ -1527,7 +1541,7 @@ namespace LiveBoard
                    value == "正在获取主播信息";
         }
 
-        private void SaveConfig(string activity)
+        private void SaveConfig(string activity, bool queueExplicitlyCleared = false)
         {
             if (_config == null)
                 return;
@@ -1540,13 +1554,21 @@ namespace LiveBoard
             _config.BilibiliCookieData = _bilibili.ExportProtectedCookies();
             _config.BilibiliUserName = _bilibili.IsLoggedIn ? _bilibili.UserName : null;
             _config.Rooms = new ObservableCollection<RoomConfig>(Rooms.Select(room => room.Clone()));
+            if (_config.Rooms.Count > 0)
+                _config.QueueExplicitlyCleared = false;
+            else if (queueExplicitlyCleared)
+                _config.QueueExplicitlyCleared = true;
             SaveMediaSettingsToConfig();
             try
             {
-                _store.Save(_config);
-                LastSavedText.Text = " · " + DateTime.Now.ToString("HH:mm") + " 已保存";
-                if (!string.IsNullOrWhiteSpace(activity))
-                    AddActivity(activity, "配置已写入本机");
+                if (_store.Save(_config))
+                {
+                    LastSavedText.Text = " · " + DateTime.Now.ToString("HH:mm") + " 已保存";
+                    if (!string.IsNullOrWhiteSpace(activity))
+                        AddActivity(activity, "配置已写入本机");
+                }
+                else
+                    LastSavedText.Text = " · 已保护已保存的直播间队列";
             }
             catch (Exception ex)
             {

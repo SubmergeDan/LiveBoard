@@ -283,6 +283,9 @@ namespace LiveBoard
         [DataMember(Order = 11)]
         public string MediaProxy { get; set; }
 
+        [DataMember(Order = 12)]
+        public bool QueueExplicitlyCleared { get; set; }
+
         public static AppConfig CreateDefault()
         {
             return new AppConfig

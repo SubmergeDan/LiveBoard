@@ -564,7 +564,7 @@
                                     <TextBlock x:Name="MediaAnalyzeStateText" Text="待解析" Foreground="{StaticResource MutedBrush}" FontSize="11" HorizontalAlignment="Right" VerticalAlignment="Center" />
                                 </Grid>
                                 <Border Background="White" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="11" Margin="0,0,0,10">
-                                    <TextBox x:Name="MediaUrlBox" Text="粘贴抖音、快手、B站、X 或 Instagram 分享地址" Foreground="{StaticResource MutedBrush}" Style="{StaticResource SoftTextBox}" ToolTip="媒体分享地址" GotFocus="MediaUrl_OnGotFocus" LostFocus="MediaUrl_OnLostFocus" />
+                                    <TextBox x:Name="MediaUrlBox" Text="粘贴任意公开网页或媒体地址" Foreground="{StaticResource MutedBrush}" Style="{StaticResource SoftTextBox}" ToolTip="公开网页或媒体地址" GotFocus="MediaUrl_OnGotFocus" LostFocus="MediaUrl_OnLostFocus" />
                                 </Border>
                                 <Grid Margin="0,0,0,12">
                                     <Grid.ColumnDefinitions>
@@ -576,7 +576,7 @@
                                     </Grid.ColumnDefinitions>
                                     <Button x:Name="AnalyzeMediaButton" Grid.Column="0" Content="解析媒体" Style="{StaticResource PrimaryButton}" Padding="18,9" Click="AnalyzeMedia_OnClick" />
                                     <Border Grid.Column="2" Background="White" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="10">
-                                        <TextBox x:Name="MediaProxyBox" Text="代理地址（可选）" Foreground="{StaticResource MutedBrush}" Style="{StaticResource SoftTextBox}" ToolTip="例如 http://127.0.0.1:7890" GotFocus="MediaProxy_OnGotFocus" LostFocus="MediaProxy_OnLostFocus" />
+                                        <TextBox x:Name="MediaProxyBox" Text="代理地址（可选，留空使用系统代理）" Foreground="{StaticResource MutedBrush}" Style="{StaticResource SoftTextBox}" ToolTip="例如 http://127.0.0.1:7890；留空时使用 Windows 系统代理" GotFocus="MediaProxy_OnGotFocus" LostFocus="MediaProxy_OnLostFocus" />
                                     </Border>
                                     <Button Grid.Column="4" Content="选择保存文件夹" Style="{StaticResource QuietButton}" Padding="12,8" Click="ChooseMediaFolder_OnClick" />
                                 </Grid>

@@ -9,7 +9,7 @@ LiveBoard 是一个 Windows 桌面直播录制与媒体导出工具，基于 .NE
 - 监控并录制抖音、Bilibili 直播间。
 - 支持多直播间队列、自动录制、定时检查、画质与分片设置。
 - 支持 Bilibili 二维码登录和 M4S 音视频无损封装。
-- 支持导出抖音、快手、Bilibili、X 和 Instagram 的公开媒体分享链接。
+- 支持导出抖音、快手、Bilibili、X、Instagram 以及 yt-dlp 支持网站的公开媒体链接；对于普通网页，还会扫描页面中可直接访问的多个 MP4、HLS、DASH、FLV、WebM 或 MOV 媒体流。
 - 内置 FFmpeg、yt-dlp、gallery-dl 和 QRCoder，运行时会将所需工具释放到本机缓存目录。
 
 ## 系统要求
@@ -46,7 +46,7 @@ dist\LiveBoard.exe
 
 1. 在“直播录制”中输入房间号或直播链接，添加到队列后可开始监控和录制。
 2. 在“B站缓存导出”中选择本地 M4S 视频、音频文件，进行无损封装。
-3. 在“媒体导出”中粘贴公开分享链接，解析完成后选择保存位置并导出。
+3. 在“媒体导出”中粘贴公开网页或媒体链接。解析完成后会列出识别到的媒体；普通网页仅能识别页面源码中可直接访问的媒体流，DRM、登录限制和动态脚本生成的受保护视频无法导出。
 
 抖音、Bilibili 等平台可能因登录、地区、风控或平台接口变更而限制访问。请仅导出你有权访问和保存的内容。
 
@@ -74,4 +74,3 @@ Tools/        打包进 EXE 的 FFmpeg、yt-dlp、gallery-dl
 本项目以 [GNU GPL v3.0 或更高版本](LICENSE) 发布。选择 GPL-3.0-or-later 是因为发行包内置了启用 GPLv3 的 FFmpeg 构建。
 
 第三方组件及其许可证、源码获取地址见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
