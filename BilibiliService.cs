@@ -18,6 +18,7 @@ namespace LiveBoard
         public string Message { get; set; }
         public string StreamUrl { get; set; }
         public string DisplayName { get; set; }
+        public string RoomTitle { get; set; }
         public string CanonicalRoomId { get; set; }
         public string[] AvailableQualities { get; set; }
     }
@@ -212,12 +213,16 @@ namespace LiveBoard
                 var canonicalRoomId = GetString(data, "room_id");
                 var uid = GetString(data, "uid");
                 var liveStatus = GetInt(data, "live_status");
+                var roomTitle = GetString(data, "title");
+                if (string.IsNullOrWhiteSpace(roomTitle))
+                    roomTitle = GetString(data, "room_title");
                 var displayName = await GetAnchorNameAsync(uid, cancellationToken);
                 var result = new BilibiliProbeResult
                 {
                     IsLive = liveStatus == 1,
                     Message = liveStatus == 1 ? "直播中" : "未开播",
                     DisplayName = displayName,
+                    RoomTitle = CleanRoomTitle(roomTitle),
                     CanonicalRoomId = string.IsNullOrWhiteSpace(canonicalRoomId) ? roomId : canonicalRoomId
                 };
                 if (result.IsLive)
@@ -259,6 +264,14 @@ namespace LiveBoard
             {
                 return null;
             }
+        }
+
+        private string CleanRoomTitle(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+            value = value.Trim();
+            return value.Length > 240 ? value.Substring(0, 240) : value;
         }
 
         private async Task<BilibiliPlayInfo> GetPlayInfoAsync(string roomId, string quality, CancellationToken cancellationToken)

@@ -11,6 +11,7 @@ namespace LiveBoard
         public string ConfigDirectory { get; private set; }
         public string ConfigPath { get; private set; }
         public string BackupPath { get; private set; }
+        public string QueueSnapshotPath { get; private set; }
         public bool LoadedFromBackup { get; private set; }
         public bool LoadedFromLegacyLocation { get; private set; }
 
@@ -19,6 +20,7 @@ namespace LiveBoard
             ConfigDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LiveBoard");
             ConfigPath = Path.Combine(ConfigDirectory, "config.json");
             BackupPath = ConfigPath + ".bak";
+            QueueSnapshotPath = Path.Combine(ConfigDirectory, "queue.json");
         }
 
         public AppConfig Load()
@@ -28,6 +30,12 @@ namespace LiveBoard
             AppConfig config;
             if (TryLoad(ConfigPath, out config))
             {
+                AppConfig snapshot;
+                if (!config.QueueExplicitlyCleared && config.Rooms.Count == 0 && TryLoad(QueueSnapshotPath, out snapshot) && snapshot.Rooms.Count > 0)
+                {
+                    config.Rooms = snapshot.Rooms;
+                    return config;
+                }
                 AppConfig backup;
                 if (!config.QueueExplicitlyCleared && config.Rooms.Count == 0 && TryLoadNonEmptyBackup(ConfigPath, out backup))
                 {
@@ -45,6 +53,9 @@ namespace LiveBoard
                 }
                 return config;
             }
+
+            if (TryLoad(QueueSnapshotPath, out config) && config.Rooms.Count > 0)
+                return config;
 
             if (TryLoadBackup(ConfigPath, out config))
             {
@@ -163,6 +174,26 @@ namespace LiveBoard
             if (ShouldPreserveExistingQueue(config))
                 return false;
             SaveTo(config, ConfigPath);
+            if (config != null && config.Rooms != null && config.Rooms.Count > 0)
+            {
+                try
+                {
+                    SaveTo(config, QueueSnapshotPath);
+                }
+                catch
+                {
+                }
+            }
+            else if (config != null && config.QueueExplicitlyCleared && File.Exists(QueueSnapshotPath))
+            {
+                try
+                {
+                    File.Delete(QueueSnapshotPath);
+                }
+                catch
+                {
+                }
+            }
             return true;
         }
 
@@ -172,7 +203,9 @@ namespace LiveBoard
                 return false;
 
             AppConfig savedConfig;
-            return TryLoad(ConfigPath, out savedConfig) && savedConfig.Rooms.Count > 0;
+            if (TryLoad(ConfigPath, out savedConfig) && savedConfig.Rooms.Count > 0)
+                return true;
+            return TryLoad(QueueSnapshotPath, out savedConfig) && savedConfig.Rooms.Count > 0;
         }
 
         public void SaveTo(AppConfig config, string path)

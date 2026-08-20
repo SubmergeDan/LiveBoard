@@ -112,6 +112,7 @@ namespace LiveBoard
         private bool _isSelected;
         private int _consecutiveOfflineChecks;
         private bool _autoRecordSuppressed;
+        private string _roomTitle;
 
         [IgnoreDataMember]
         public string LiveStatus
@@ -178,6 +179,13 @@ namespace LiveBoard
         {
             get { return _autoRecordSuppressed; }
             set { _autoRecordSuppressed = value; }
+        }
+
+        [IgnoreDataMember]
+        public string RoomTitle
+        {
+            get { return _roomTitle; }
+            set { SetRuntimeValue(ref _roomTitle, value, "RoomTitle"); }
         }
 
         [IgnoreDataMember]

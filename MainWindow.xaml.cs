@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
@@ -42,6 +43,7 @@ namespace LiveBoard
         private readonly Dictionary<RoomConfig, CancellationTokenSource> _recordingCancellations = new Dictionary<RoomConfig, CancellationTokenSource>();
         private readonly Dictionary<RoomConfig, DateTime> _recordingStartedAt = new Dictionary<RoomConfig, DateTime>();
         private readonly HashSet<RoomConfig> _recordingStarting = new HashSet<RoomConfig>();
+        private readonly HashSet<RoomConfig> _recordingSizeRotating = new HashSet<RoomConfig>();
         private readonly Dictionary<RoomConfig, int> _recordingReconnectAttempts = new Dictionary<RoomConfig, int>();
         private readonly DispatcherTimer _monitorTimer;
         private readonly DispatcherTimer _recordingClockTimer;
@@ -61,6 +63,7 @@ namespace LiveBoard
         private string _muxAudioPath;
         private string _lastMuxOutputPath;
         private HwndSource _windowSource;
+        private bool _isClosing;
 
         public ObservableCollection<RoomConfig> Rooms { get; private set; }
 
@@ -105,6 +108,7 @@ namespace LiveBoard
         private async void Window_Loaded(object sender, RoutedEventArgs e)
         {
             _config = _store.Load();
+            _loadingControls = true;
             if (_store.LoadedFromBackup)
                 AddActivity("已恢复直播间配置", "主配置为空或不可读取，已自动恢复上一份备份");
             else if (_store.LoadedFromLegacyLocation)
@@ -114,13 +118,14 @@ namespace LiveBoard
             ReplaceRooms(_config.Rooms);
             OutputPathBox.Text = _config.OutputDirectory;
             IntervalText.Text = _config.CheckIntervalSeconds + " 秒";
-            _loadingControls = true;
             PlatformCombo.SelectedItem = NormalizePlatform(_config.DefaultPlatform);
             RefreshAddQualityOptions(_config.DefaultQuality);
             UpdateAddQualityEditorVisibility();
             AddFormatCombo.SelectedItem = _config.DefaultFormat;
             IntervalSlider.Value = Math.Max(1, Math.Min(120, _config.CheckIntervalSeconds));
             _loadingControls = false;
+            if (Rooms.Count > 0)
+                SaveConfig(null);
             UpdateBilibiliAccountUi();
             RefreshAllRoomQualityOptions(false);
             AddActivity("工作区已加载", "已恢复 " + Rooms.Count + " 个直播间配置");
@@ -708,6 +713,7 @@ namespace LiveBoard
         {
             if (room == null)
                 return;
+            _recordingSizeRotating.Remove(room);
             CancellationTokenSource cancellation;
             if (_recordingCancellations.TryGetValue(room, out cancellation))
             {
@@ -747,6 +753,58 @@ namespace LiveBoard
             UpdateTasks();
         }
 
+        private async void RotateRecordingForSizeAsync(RoomConfig room, RecordingSession session)
+        {
+            if (room == null || session == null || !_recordingSizeRotating.Add(room))
+                return;
+
+            RecordingSession current;
+            if (!_recordingSessions.TryGetValue(room, out current) || !ReferenceEquals(current, session))
+            {
+                _recordingSizeRotating.Remove(room);
+                return;
+            }
+
+            _recordingSessions.Remove(room);
+            CancellationTokenSource cancellation;
+            if (_recordingCancellations.TryGetValue(room, out cancellation))
+            {
+                _recordingCancellations.Remove(room);
+                cancellation.Dispose();
+            }
+            room.RecordingStatus = "正在封装分片";
+            UpdateSelectedRoomStatus();
+            RefreshRoomCards();
+            UpdateTasks();
+
+            var finalized = await Task.Run(() => session.Stop());
+            var outputPath = session.OutputPath;
+            var nextSegmentIndex = session.SegmentIndex + 1;
+            session.Dispose();
+            if (!_recordingSizeRotating.Remove(room) || !room.IsRecording)
+                return;
+
+            if (!finalized)
+            {
+                room.IsRecording = false;
+                room.RecordingStatus = "分片封装失败";
+                _recordingStartedAt.Remove(room);
+                room.RecordingElapsed = string.Empty;
+                AddActivity("分片停止超时", "FFmpeg 未能正常写完文件尾部：" + Path.GetFileName(outputPath));
+                UpdateSelectedRoomStatus();
+                RefreshRoomCards();
+                UpdateTasks();
+                return;
+            }
+
+            room.RecordingStatus = "切换分片";
+            AddActivity("录制分片已封装", Path.GetFileName(outputPath));
+            UpdateSelectedRoomStatus();
+            RefreshRoomCards();
+            UpdateTasks();
+            await StartRoomRecordingAsync(room, nextSegmentIndex);
+        }
+
         private void RecordingProcess_Exited(RoomConfig room, RecordingSession session)
         {
             Dispatcher.BeginInvoke(new Action(delegate
@@ -760,14 +818,6 @@ namespace LiveBoard
                 {
                     _recordingCancellations.Remove(room);
                     cancellation.Dispose();
-                }
-                if (!session.StopRequested && session.ReachedSizeLimit && (room.SegmentMode == "大小"))
-                {
-                    room.RecordingStatus = "切换分片";
-                    session.Dispose();
-                    RefreshRoomCards();
-                    RestartRecordingAfterRotation(room, session.SegmentIndex + 1);
-                    return;
                 }
                 var stopRequested = session.StopRequested;
                 var errorText = session.ErrorText;
@@ -1418,11 +1468,6 @@ namespace LiveBoard
             RunStatusCheckAsync();
         }
 
-        private async void RestartRecordingAfterRotation(RoomConfig room, int segmentIndex)
-        {
-            await StartRoomRecordingAsync(room, segmentIndex);
-        }
-
         private async void RestartRecordingAfterFailure(RoomConfig room, int segmentIndex)
         {
             await Task.Delay(1500);
@@ -1474,6 +1519,8 @@ namespace LiveBoard
                     room.Remark = result.DisplayName.Trim();
                     capturedName = true;
                 }
+                if (!string.IsNullOrWhiteSpace(result.RoomTitle))
+                    room.RoomTitle = result.RoomTitle.Trim();
                 if (result.HasError)
                 {
                     room.LiveStatus = "检查失败";
@@ -1601,18 +1648,15 @@ namespace LiveBoard
         {
             foreach (var runningRoom in _recordingSessions.Keys.ToList())
                 StopRoomRecording(runningRoom, false);
+            var restoredRooms = rooms == null
+                ? new List<RoomConfig>()
+                : rooms.Where(room => room != null && !string.IsNullOrWhiteSpace(room.RoomId)).Select(room => room.Clone()).ToList();
             Rooms.Clear();
-            if (rooms != null)
+            foreach (var room in restoredRooms)
             {
-                foreach (var room in rooms)
-                {
-                    if (room != null && !string.IsNullOrWhiteSpace(room.RoomId))
-                    {
-                        room.Platform = NormalizePlatform(room.Platform);
-                        PopulateRoomQualityOptions(room, false);
-                        Rooms.Add(room);
-                    }
-                }
+                room.Platform = NormalizePlatform(room.Platform);
+                PopulateRoomQualityOptions(room, false);
+                Rooms.Add(room);
             }
             _selectedRoom = null;
             ClearSelectedRoom();
@@ -1649,6 +1693,11 @@ namespace LiveBoard
 
         private void RecordingClockTimer_OnTick(object sender, EventArgs e)
         {
+            foreach (var entry in _recordingSessions.ToList())
+            {
+                if (entry.Key.SegmentMode == "大小" && entry.Value.ReachedSizeLimit)
+                    RotateRecordingForSizeAsync(entry.Key, entry.Value);
+            }
             foreach (var entry in _recordingStartedAt.ToList())
             {
                 if (!entry.Key.IsRecording)
@@ -1919,6 +1968,14 @@ namespace LiveBoard
 
         private void Close_OnClick(object sender, RoutedEventArgs e)
         {
+            Close();
+        }
+
+        private void Window_OnClosing(object sender, CancelEventArgs e)
+        {
+            if (_isClosing)
+                return;
+            _isClosing = true;
             SaveConfig(null);
             if (_muxCancellation != null)
                 _muxCancellation.Cancel();
@@ -1935,7 +1992,6 @@ namespace LiveBoard
             }
             foreach (var room in Rooms.ToList())
                 StopRoomRecording(room, false);
-            Close();
         }
     }
 }

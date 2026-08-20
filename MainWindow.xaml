@@ -14,7 +14,8 @@
         AllowsTransparency="True"
         FontFamily="pack://application:,,,/Fonts/#MiSans"
         Background="Transparent"
-        Loaded="Window_Loaded">
+        Loaded="Window_Loaded"
+        Closing="Window_OnClosing">
     <shell:WindowChrome.WindowChrome>
         <shell:WindowChrome CaptionHeight="86"
                             ResizeBorderThickness="6"
@@ -249,6 +250,7 @@
                                                             <Border Width="8" Height="8" CornerRadius="4" Background="{StaticResource BrightGreenBrush}" VerticalAlignment="Top" Margin="0,3,0,0" />
                                                             <StackPanel Grid.Column="1" Margin="10,0,8,0">
                                                                 <TextBlock Text="{Binding DisplayName}" Foreground="{StaticResource InkBrush}" FontWeight="Medium" FontSize="13" />
+                                                                <TextBlock Text="{Binding RoomTitle}" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" ToolTip="{Binding RoomTitle}" />
                                                                 <StackPanel Orientation="Horizontal" Margin="0,3,0,0">
                                                                     <Border Background="#E7E9E3" CornerRadius="6" Padding="5,2" Margin="0,0,6,0">
                                                                         <TextBlock Text="{Binding PlatformLabel}" Foreground="{StaticResource MutedBrush}" FontSize="9" />

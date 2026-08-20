@@ -292,7 +292,7 @@ namespace LiveBoard
 
         private void MediaCookie_OnChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (_config != null)
+            if (!_loadingControls && _config != null)
                 SaveConfig(null);
         }
 

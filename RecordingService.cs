@@ -134,6 +134,7 @@ namespace LiveBoard
         public string Message { get; set; }
         public string StreamUrl { get; set; }
         public string DisplayName { get; set; }
+        public string RoomTitle { get; set; }
         public string[] AvailableQualities { get; set; }
     }
 
@@ -141,6 +142,7 @@ namespace LiveBoard
     {
         public string StreamUrl { get; set; }
         public string DisplayName { get; set; }
+        public string RoomTitle { get; set; }
     }
 
     public sealed class RecordingService
@@ -265,6 +267,7 @@ namespace LiveBoard
                     Message = bilibiliResult.Message,
                     StreamUrl = bilibiliResult.StreamUrl,
                     DisplayName = bilibiliResult.DisplayName,
+                    RoomTitle = bilibiliResult.RoomTitle,
                     AvailableQualities = bilibiliResult.AvailableQualities
                 };
             }
@@ -276,7 +279,8 @@ namespace LiveBoard
                     IsLive = !string.IsNullOrWhiteSpace(page.StreamUrl),
                     Message = string.IsNullOrWhiteSpace(page.StreamUrl) ? "未开播" : "直播中",
                     StreamUrl = page.StreamUrl,
-                    DisplayName = page.DisplayName
+                    DisplayName = page.DisplayName,
+                    RoomTitle = page.RoomTitle
                 };
             }
             catch (OperationCanceledException)
@@ -384,7 +388,8 @@ namespace LiveBoard
                 return new RoomPageResult
                 {
                     StreamUrl = ChooseQuality(candidates, quality),
-                    DisplayName = ExtractAnchorName(html)
+                    DisplayName = ExtractAnchorName(html),
+                    RoomTitle = ExtractRoomTitle(html)
                 };
             }
         }
@@ -415,6 +420,70 @@ namespace LiveBoard
 
             var title = Regex.Match(html, @"<title[^>]*>(?<name>[^<]{1,160})</title>", RegexOptions.IgnoreCase);
             return title.Success ? CleanAnchorName(title.Groups["name"].Value) : null;
+        }
+
+        private string ExtractRoomTitle(string html)
+        {
+            if (string.IsNullOrWhiteSpace(html))
+                return null;
+
+            // The page contains unrelated recommendation and advertising cards. Anchor the
+            // lookup to the room owner, which also provides the verified anchor nickname.
+            var ownerIndex = html.IndexOf("\"owner\"", StringComparison.OrdinalIgnoreCase);
+            if (ownerIndex < 0)
+                return null;
+
+            var roomStart = html.LastIndexOf("\"room\"", ownerIndex, StringComparison.OrdinalIgnoreCase);
+            if (roomStart < 0 || ownerIndex - roomStart > 16000)
+                roomStart = Math.Max(0, ownerIndex - 12000);
+            var title = ExtractRoomTitleFromScope(html.Substring(roomStart, ownerIndex - roomStart), true);
+            if (!string.IsNullOrWhiteSpace(title))
+                return title;
+
+            var afterOwnerLength = Math.Min(4000, html.Length - ownerIndex);
+            return ExtractRoomTitleFromScope(html.Substring(ownerIndex, afterOwnerLength), false);
+        }
+
+        private string ExtractRoomTitleFromScope(string scope, bool preferLast)
+        {
+            var matches = Regex.Matches(scope, @"""(?:title|room_title)""\s*:\s*""(?<title>[^""]{1,240})""", RegexOptions.IgnoreCase);
+            if (preferLast)
+            {
+                for (var index = matches.Count - 1; index >= 0; index--)
+                {
+                    var title = CleanRoomTitle(matches[index].Groups["title"].Value);
+                    if (!string.IsNullOrWhiteSpace(title))
+                        return title;
+                }
+                return null;
+            }
+
+            foreach (Match match in matches)
+            {
+                var title = CleanRoomTitle(match.Groups["title"].Value);
+                if (!string.IsNullOrWhiteSpace(title))
+                    return title;
+            }
+            return null;
+        }
+
+        private string CleanRoomTitle(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+            value = WebUtility.HtmlDecode(value).Trim();
+            value = Regex.Replace(value, @"\\u([0-9a-fA-F]{4})", delegate(Match match)
+            {
+                return ((char)Convert.ToInt32(match.Groups[1].Value, 16)).ToString();
+            });
+            value = value.Replace("\\/", "/").Replace("\\\"", "\"").Trim();
+            if (value.Length == 0 || value.Length > 240 ||
+                value.Equals("null", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("undefined", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("false", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("广告投放", StringComparison.OrdinalIgnoreCase))
+                return null;
+            return value;
         }
 
         private string FirstValidNickname(string html)
@@ -486,19 +555,22 @@ namespace LiveBoard
             var headers = "Referer: " + referer + "\r\n" +
                           "Origin: " + origin + "\r\n" +
                           "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36\r\n";
-            var args = "-y -hide_banner -loglevel warning -rw_timeout 20000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -headers \"" + headers + "\" -i \"" + streamUrl + "\" -c copy";
+            var args = "-y -hide_banner -loglevel warning -rw_timeout 20000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -headers \"" + headers + "\" -i \"" + streamUrl + "\" -c copy";
             if (segmentMode == "时间")
             {
                 var minutes = Math.Max(1, segmentMinutes <= 0 ? 60 : segmentMinutes);
-                args += " -f segment -segment_time " + (minutes * 60) + " -reset_timestamps 1 -segment_format " + (extension == "ts" ? "mpegts" : extension);
+                args += " -f segment -segment_time " + (minutes * 60) + " -segment_format " + (extension == "ts" ? "mpegts" : extension);
+                if (extension == "mp4")
+                    args += " -segment_format_options movflags=+frag_keyframe+empty_moov+default_base_moof";
             }
             else if (segmentMode == "大小")
             {
-                args += " -fs " + Math.Max(1L, maxBytes);
                 if (extension == "flv")
                     args += " -f flv";
                 else if (extension == "ts")
                     args += " -f mpegts";
+                else
+                    args += " -movflags +frag_keyframe+empty_moov+default_base_moof";
             }
             else if (extension == "flv")
             {
@@ -507,6 +579,10 @@ namespace LiveBoard
             else if (extension == "ts")
             {
                 args += " -f mpegts";
+            }
+            else
+            {
+                args += " -movflags +frag_keyframe+empty_moov+default_base_moof";
             }
             return args + " \"" + outputPath + "\"";
         }
