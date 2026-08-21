@@ -148,6 +148,8 @@ namespace LiveBoard
     {
         private const string YtDlpResource = "LiveBoard.Resources.yt-dlp.exe";
         private const string GalleryDlpResource = "LiveBoard.Resources.gallery-dl.exe";
+        private const string DouyinUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36";
+        private const string DouyinSpiderUserAgent = "Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)";
         private const int MaxPageMediaAssets = 100;
         private static readonly object ToolLock = new object();
         private static readonly Regex UrlRegex = new Regex(@"https?://[^\s\]\)>]+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -166,12 +168,18 @@ namespace LiveBoard
             var platform = DetectPlatform(url) ?? "网页";
 
             if (string.Equals(platform, "抖音", StringComparison.OrdinalIgnoreCase))
+            {
                 url = await NormalizeDouyinUrlAsync(url, effectiveProxy, cancellationToken, progress);
+                if (IsDouyinNoteUrl(url))
+                    return await AnalyzeDouyinNoteAsync(url, effectiveProxy, cancellationToken, progress);
+            }
 
             string cookiePath = null;
             try
             {
-                cookiePath = CreateCookieFile(bilibiliCookies, platform == "Bilibili");
+                cookiePath = string.Equals(platform, "抖音", StringComparison.OrdinalIgnoreCase)
+                    ? await CreateDouyinCookieFileAsync(effectiveProxy, cancellationToken, progress)
+                    : CreateCookieFile(bilibiliCookies, platform == "Bilibili");
                 if (platform == "快手")
                     return await AnalyzeKuaishouAsync(url, effectiveProxy, cancellationToken, progress);
                 if (platform == "X" || platform == "Instagram")
@@ -236,7 +244,11 @@ namespace LiveBoard
             try
             {
                 var effectiveProxy = ResolveProxy(proxy, GetDownloadUrl(analysis, selectedAssets));
-                cookiePath = CreateCookieFile(bilibiliCookies, string.Equals(analysis.Platform, "Bilibili", StringComparison.OrdinalIgnoreCase));
+                if (string.Equals(analysis.Engine, "direct-image", StringComparison.OrdinalIgnoreCase))
+                    return await ExportDirectImagesAsync(analysis, selectedAssets, outputDirectory, effectiveProxy, cancellationToken, progress);
+                cookiePath = string.Equals(analysis.Platform, "抖音", StringComparison.OrdinalIgnoreCase)
+                    ? await CreateDouyinCookieFileAsync(effectiveProxy, cancellationToken, progress)
+                    : CreateCookieFile(bilibiliCookies, string.Equals(analysis.Platform, "Bilibili", StringComparison.OrdinalIgnoreCase));
                 var before = SafeFileCount(outputDirectory);
                 MediaToolResult run;
                 if (string.Equals(analysis.Engine, "gallery-dl", StringComparison.OrdinalIgnoreCase))
@@ -273,6 +285,7 @@ namespace LiveBoard
                     // is unnecessary for public direct streams.
                     if (!string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase))
                         AddCookieArguments(arguments, cookieBrowser, cookiePath);
+                    AddDouyinRequestArguments(arguments, analysis.Platform, analysis.Url);
                     if (string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(analysis.Url))
                     {
                         arguments.Add("--ignore-errors");
@@ -357,6 +370,117 @@ namespace LiveBoard
             }
         }
 
+        private async Task<MediaExportResult> ExportDirectImagesAsync(MediaAnalysisResult analysis, IList<MediaAssetInfo> selectedAssets, string outputDirectory, string proxy, CancellationToken cancellationToken, Action<string> progress)
+        {
+            var completed = 0;
+            var errors = new StringBuilder();
+            using (var handler = new HttpClientHandler
+            {
+                AllowAutoRedirect = true,
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+            })
+            {
+                if (!string.IsNullOrWhiteSpace(proxy))
+                {
+                    handler.Proxy = new WebProxy(proxy.Trim());
+                    handler.UseProxy = true;
+                }
+                using (var client = new HttpClient(handler))
+                {
+                    client.Timeout = TimeSpan.FromMinutes(2);
+                    client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", DouyinSpiderUserAgent);
+                    client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8");
+                    foreach (var asset in selectedAssets.OrderBy(item => item.Index))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var temporaryPath = Path.Combine(outputDirectory, ".LiveBoard-" + Guid.NewGuid().ToString("N") + ".part");
+                        try
+                        {
+                            ReportProgress(progress, "正在下载第 " + (completed + 1) + "/" + selectedAssets.Count + " 张图片");
+                            Exception downloadError = null;
+                            foreach (var requestUrl in new[] { asset.Url, GetDouyinImageHttpFallbackUrl(asset.Url) }.Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase))
+                            {
+                                DeleteQuietly(temporaryPath);
+                                try
+                                {
+                                    using (var request = new HttpRequestMessage(HttpMethod.Get, requestUrl))
+                                    {
+                                        Uri referer;
+                                        if (Uri.TryCreate(analysis.Url, UriKind.Absolute, out referer))
+                                            request.Headers.Referrer = referer;
+                                        using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                                        {
+                                            response.EnsureSuccessStatusCode();
+                                            var total = response.Content.Headers.ContentLength.GetValueOrDefault(asset.FileSize);
+                                            using (var input = await response.Content.ReadAsStreamAsync())
+                                            using (var output = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                                            {
+                                                var buffer = new byte[81920];
+                                                long downloaded = 0;
+                                                while (true)
+                                                {
+                                                    var read = await input.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                                                    if (read == 0)
+                                                        break;
+                                                    await output.WriteAsync(buffer, 0, read, cancellationToken);
+                                                    downloaded += read;
+                                                    ReportProgress(progress, "__RH_PROGRESS__" + downloaded.ToString(CultureInfo.InvariantCulture) + "|" + total.ToString(CultureInfo.InvariantCulture) + "|" + total.ToString(CultureInfo.InvariantCulture) + "|NA|NA|NA");
+                                                }
+                                                asset.FileSize = downloaded;
+                                            }
+                                        }
+                                    }
+                                    downloadError = null;
+                                    break;
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    throw;
+                                }
+                                catch (Exception ex)
+                                {
+                                    downloadError = ex;
+                                }
+                            }
+                            if (downloadError != null)
+                                throw downloadError;
+
+                            var extension = Regex.IsMatch(asset.Extension ?? string.Empty, @"^[a-zA-Z0-9]{1,8}$") ? asset.Extension.ToLowerInvariant() : "webp";
+                            var mediaId = GetDouyinMediaId(analysis.Url);
+                            var stem = asset.Index.ToString("000", CultureInfo.InvariantCulture) + "_" + SafeFileNamePart(analysis.Title);
+                            if (!string.IsNullOrWhiteSpace(mediaId))
+                                stem += "_" + mediaId;
+                            var outputPath = GetAvailableOutputPath(outputDirectory, stem, extension);
+                            File.Move(temporaryPath, outputPath);
+                            completed++;
+                            ReportProgress(progress, "__RH_OUTPUT__" + outputPath);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            DeleteQuietly(temporaryPath);
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            DeleteQuietly(temporaryPath);
+                            errors.AppendLine("第 " + asset.Index + " 张图片：" + ex.Message);
+                        }
+                    }
+                }
+            }
+
+            var failed = selectedAssets.Count - completed;
+            return new MediaExportResult
+            {
+                Success = completed > 0,
+                PartialSuccess = completed > 0 && failed > 0,
+                ErrorText = failed == 0 ? null : (completed == 0 ? "图片下载失败：" : "有 " + failed + " 张图片下载失败：") + MapError(errors.ToString(), "抖音"),
+                LogText = errors.ToString().Trim(),
+                OutputDirectory = outputDirectory,
+                DownloadedCount = completed
+            };
+        }
+
         public static string ExtractUrl(string input)
         {
             if (string.IsNullOrWhiteSpace(input))
@@ -369,10 +493,6 @@ namespace LiveBoard
 
         private async Task<string> NormalizeDouyinUrlAsync(string url, string proxy, CancellationToken cancellationToken, Action<string> progress)
         {
-            var normalized = NormalizeDouyinNoteUrl(url);
-            if (!string.Equals(normalized, url, StringComparison.OrdinalIgnoreCase))
-                return normalized;
-
             Uri uri;
             if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || !string.Equals(uri.Host, "v.douyin.com", StringComparison.OrdinalIgnoreCase))
                 return url;
@@ -390,13 +510,13 @@ namespace LiveBoard
                     using (var client = new HttpClient(handler))
                     {
                         client.Timeout = TimeSpan.FromSeconds(20);
-                        client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36");
+                        client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", DouyinUserAgent);
                         using (var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
                         {
                             var finalUri = response.RequestMessage == null ? null : response.RequestMessage.RequestUri;
                             if (finalUri == null)
                                 return url;
-                            var finalUrl = NormalizeDouyinNoteUrl(finalUri.ToString());
+                            var finalUrl = finalUri.ToString();
                             return IsDouyinMediaUrl(finalUrl) ? finalUrl : url;
                         }
                     }
@@ -412,22 +532,14 @@ namespace LiveBoard
             }
         }
 
-        private static string NormalizeDouyinNoteUrl(string url)
+        private static bool IsDouyinNoteUrl(string url)
         {
             Uri uri;
             if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || !string.Equals(uri.Host, "www.douyin.com", StringComparison.OrdinalIgnoreCase))
-                return url;
+                return false;
 
             var segments = uri.AbsolutePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
-            if (segments.Length < 2 || !string.Equals(segments[0], "note", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(segments[1]))
-                return url;
-
-            var builder = new UriBuilder(uri)
-            {
-                Path = "/video/" + segments[1],
-                Query = string.Empty
-            };
-            return builder.Uri.ToString();
+            return segments.Length >= 2 && string.Equals(segments[0], "note", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(segments[1]);
         }
 
         private static bool IsDouyinMediaUrl(string url)
@@ -437,6 +549,172 @@ namespace LiveBoard
                 return false;
             var path = uri.AbsolutePath.Trim('/');
             return path.StartsWith("video/", StringComparison.OrdinalIgnoreCase) || path.StartsWith("note/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task<MediaAnalysisResult> AnalyzeDouyinNoteAsync(string url, string proxy, CancellationToken cancellationToken, Action<string> progress)
+        {
+            ReportProgress(progress, "正在读取抖音图文");
+            try
+            {
+                using (var handler = new HttpClientHandler
+                {
+                    AllowAutoRedirect = true,
+                    AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+                })
+                {
+                    if (!string.IsNullOrWhiteSpace(proxy))
+                    {
+                        handler.Proxy = new WebProxy(proxy.Trim());
+                        handler.UseProxy = true;
+                    }
+                    using (var client = new HttpClient(handler))
+                    {
+                        client.Timeout = TimeSpan.FromSeconds(60);
+                        client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", DouyinSpiderUserAgent);
+                        client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+                        using (var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                        {
+                            response.EnsureSuccessStatusCode();
+                            var html = await ReadPageTextAsync(response.Content, cancellationToken);
+                            Dictionary<string, object> article = null;
+                            foreach (Match match in Regex.Matches(html ?? string.Empty, @"<script\b[^>]*\btype\s*=\s*[\""']application/ld\+json[\""'][^>]*>(?<json>[\s\S]*?)</script>", RegexOptions.IgnoreCase))
+                            {
+                                try
+                                {
+                                    var candidate = _serializer.DeserializeObject(WebUtility.HtmlDecode(match.Groups["json"].Value.Trim())) as Dictionary<string, object>;
+                                    if (string.Equals(FirstString(candidate, "@type"), "article", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        article = candidate;
+                                        break;
+                                    }
+                                }
+                                catch
+                                {
+                                }
+                            }
+                            if (article == null)
+                                return Failure(url, "抖音没有返回该图文的媒体信息，作品可能已删除、转为私密或受到地区限制。");
+
+                            var imageValue = GetValue(article, "image");
+                            var imageUrls = (imageValue is string ? new[] { imageValue } : AsEnumerable(imageValue))
+                                .Select(Convert.ToString)
+                                .Where(IsHttpUrl)
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .Take(MaxPageMediaAssets)
+                                .ToList();
+                            if (imageUrls.Count == 0)
+                                return Failure(url, "该抖音图文没有返回可下载的图片。");
+
+                            var author = GetValue(article, "author") as Dictionary<string, object>;
+                            var title = FirstString(article, "headline", "articleBody");
+                            if (string.IsNullOrWhiteSpace(title))
+                                title = FirstString(author, "name") ?? FirstString(article, "description") ?? "抖音图文";
+                            var result = new MediaAnalysisResult
+                            {
+                                Success = true,
+                                Platform = "抖音",
+                                Url = url,
+                                Engine = "direct-image",
+                                Title = title.Replace("\r", " ").Replace("\n", " ").Trim()
+                            };
+                            for (var index = 0; index < imageUrls.Count; index++)
+                            {
+                                var extension = ExtensionFromUrl(imageUrls[index]);
+                                result.Assets.Add(new MediaAssetInfo
+                                {
+                                    Index = index + 1,
+                                    Type = "图片",
+                                    Extension = string.IsNullOrWhiteSpace(extension) ? "webp" : extension.ToLowerInvariant(),
+                                    Url = imageUrls[index],
+                                    ThumbnailUrl = imageUrls[index]
+                                });
+                            }
+                            result.AssetCount = result.Assets.Count;
+                            foreach (var asset in result.Assets)
+                            {
+                                ReportProgress(progress, "正在读取第 " + asset.Index + "/" + result.Assets.Count + " 张图片信息");
+                                await EnrichDouyinImageAsync(asset, client, url, cancellationToken);
+                                ReportProgress(progress, "正在生成第 " + asset.Index + "/" + result.Assets.Count + " 张图片预览");
+                                await ProbeVideoAssetAsync(asset, url, proxy, cancellationToken);
+                            }
+                            return result;
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return Failure(url, MapError(ex.GetBaseException().Message, "抖音"));
+            }
+        }
+
+        private static async Task EnrichDouyinImageAsync(MediaAssetInfo asset, HttpClient client, string pageUrl, CancellationToken cancellationToken)
+        {
+            Exception lastError = null;
+            foreach (var requestUrl in new[] { asset.Url, GetDouyinImageHttpFallbackUrl(asset.Url) }.Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    using (var request = new HttpRequestMessage(HttpMethod.Get, requestUrl))
+                    {
+                        request.Headers.TryAddWithoutValidation("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8");
+                        Uri referer;
+                        if (Uri.TryCreate(pageUrl, UriKind.Absolute, out referer))
+                            request.Headers.Referrer = referer;
+                        using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                        {
+                            response.EnsureSuccessStatusCode();
+                            asset.FileSize = response.Content.Headers.ContentLength.GetValueOrDefault();
+                            IEnumerable<string> imageLengths;
+                            long imageLength;
+                            if (asset.FileSize <= 0 && response.Headers.TryGetValues("X-Length", out imageLengths) &&
+                                long.TryParse(imageLengths.FirstOrDefault(), NumberStyles.Integer, CultureInfo.InvariantCulture, out imageLength))
+                                asset.FileSize = imageLength;
+
+                            IEnumerable<string> imageDetails;
+                            if (response.Headers.TryGetValues("X-Imagex-Extra", out imageDetails))
+                            {
+                                var details = imageDetails.FirstOrDefault() ?? string.Empty;
+                                var width = Regex.Match(details, "\"w\"\\s*:\\s*(?<value>\\d+)");
+                                var height = Regex.Match(details, "\"h\"\\s*:\\s*(?<value>\\d+)");
+                                if (width.Success)
+                                    asset.Width = GetInt(width.Groups["value"].Value);
+                                if (height.Success)
+                                    asset.Height = GetInt(height.Groups["value"].Value);
+                            }
+
+                            if (asset.FileSize <= 0)
+                            {
+                                using (var input = await response.Content.ReadAsStreamAsync())
+                                {
+                                    var buffer = new byte[81920];
+                                    while (true)
+                                    {
+                                        var read = await input.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                                        if (read == 0)
+                                            break;
+                                        asset.FileSize += read;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                }
+            }
+            throw lastError ?? new HttpRequestException("抖音图片服务器没有返回媒体信息。");
         }
 
         private async Task<MediaAnalysisResult> AnalyzeYtDlpAsync(string url, string platform, string cookieBrowser, string proxy, string cookiePath, CancellationToken cancellationToken, Action<string> progress)
@@ -450,6 +728,7 @@ namespace LiveBoard
                     "--encoding", "utf-8", "--socket-timeout", "30"
                 };
                 AddCookieArguments(arguments, cookieBrowser, cookiePath);
+                AddDouyinRequestArguments(arguments, platform, url);
                 AddProxyArgument(arguments, proxy);
                 arguments.Add(url);
                 ReportProgress(progress, "正在识别视频与画质");
@@ -775,6 +1054,11 @@ namespace LiveBoard
                         {
                             if (!response.IsSuccessStatusCode)
                                 continue;
+                            IEnumerable<string> imageLengths;
+                            long imageLength;
+                            if (response.Headers.TryGetValues("X-Length", out imageLengths) &&
+                                long.TryParse(imageLengths.FirstOrDefault(), NumberStyles.Integer, CultureInfo.InvariantCulture, out imageLength) && imageLength > 0)
+                                return imageLength;
                             if (response.Content.Headers.ContentRange != null && response.Content.Headers.ContentRange.HasLength)
                                 return response.Content.Headers.ContentRange.Length.Value;
                             var length = response.Content.Headers.ContentLength.GetValueOrDefault();
@@ -800,6 +1084,12 @@ namespace LiveBoard
             var previewPath = GetMediaPreviewPath(asset.Url);
             Directory.CreateDirectory(Path.GetDirectoryName(previewPath));
             var createPreview = !File.Exists(previewPath) || new FileInfo(previewPath).Length == 0;
+            var isImage = string.Equals(asset.Type, "图片", StringComparison.OrdinalIgnoreCase);
+            if (isImage && !createPreview)
+            {
+                asset.ThumbnailUrl = previewPath;
+                return;
+            }
             var arguments = new List<string> { "-hide_banner", "-y", "-loglevel", "info" };
             if (!string.IsNullOrWhiteSpace(proxy))
             {
@@ -809,11 +1099,14 @@ namespace LiveBoard
             arguments.Add("-referer");
             arguments.Add(pageUrl);
             arguments.Add("-user_agent");
-            arguments.Add("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36");
-            arguments.Add("-ss");
-            arguments.Add("1");
+            arguments.Add(isImage ? DouyinSpiderUserAgent : DouyinUserAgent);
+            if (!isImage)
+            {
+                arguments.Add("-ss");
+                arguments.Add("1");
+            }
             arguments.Add("-i");
-            arguments.Add(asset.Url);
+            arguments.Add(isImage ? GetDouyinImageHttpFallbackUrl(asset.Url) ?? asset.Url : asset.Url);
             arguments.Add("-frames:v");
             arguments.Add("1");
             arguments.Add("-an");
@@ -1261,6 +1554,85 @@ namespace LiveBoard
             return path;
         }
 
+        private async Task<string> CreateDouyinCookieFileAsync(string proxy, CancellationToken cancellationToken, Action<string> progress)
+        {
+            try
+            {
+                ReportProgress(progress, "正在建立抖音匿名会话");
+                var cookies = new CookieContainer();
+                using (var handler = new HttpClientHandler
+                {
+                    AllowAutoRedirect = true,
+                    AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
+                    CookieContainer = cookies,
+                    UseCookies = true
+                })
+                {
+                    if (!string.IsNullOrWhiteSpace(proxy))
+                    {
+                        handler.Proxy = new WebProxy(proxy.Trim());
+                        handler.UseProxy = true;
+                    }
+                    using (var client = new HttpClient(handler))
+                    {
+                        client.Timeout = TimeSpan.FromSeconds(20);
+                        client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", DouyinUserAgent);
+                        client.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "zh-CN,zh;q=0.9");
+
+                        const string payload = "{\"region\":\"cn\",\"aid\":1768,\"needFid\":false,\"service\":\"www.douyin.com\",\"migrate_info\":{\"ticket\":\"\",\"source\":\"node\"},\"cbUrlProtocol\":\"https\",\"union\":true}";
+                        using (var content = new StringContent(payload, Encoding.UTF8, "application/json"))
+                        using (var response = await client.PostAsync("https://ttwid.bytedance.com/ttwid/union/register/", content, cancellationToken))
+                        {
+                            response.EnsureSuccessStatusCode();
+                            var registration = _serializer.DeserializeObject(await response.Content.ReadAsStringAsync()) as Dictionary<string, object>;
+                            var callback = FirstString(registration, "redirect_url");
+                            Uri callbackUri;
+                            if (!Uri.TryCreate(callback, UriKind.Absolute, out callbackUri) || !callbackUri.Host.EndsWith("douyin.com", StringComparison.OrdinalIgnoreCase))
+                                return null;
+                            using (var callbackResponse = await client.GetAsync(callbackUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                                callbackResponse.EnsureSuccessStatusCode();
+                        }
+
+                        var douyinUri = new Uri("https://www.douyin.com/");
+                        cookies.SetCookies(douyinUri, "s_v_web_id=verify_" + Guid.NewGuid().ToString("N") + "; Path=/; Secure");
+                        var values = cookies.GetCookies(douyinUri);
+                        if (values["ttwid"] == null || values["s_v_web_id"] == null)
+                            return null;
+                        return WriteCookieFile(values);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string WriteCookieFile(CookieCollection cookies)
+        {
+            var builder = new StringBuilder("# Netscape HTTP Cookie File\r\n");
+            foreach (Cookie cookie in cookies)
+            {
+                var domain = string.IsNullOrWhiteSpace(cookie.Domain) ? "www.douyin.com" : cookie.Domain;
+                var expires = cookie.Expires == DateTime.MinValue
+                    ? DateTimeOffset.UtcNow.AddDays(1).ToUnixTimeSeconds()
+                    : new DateTimeOffset(cookie.Expires.ToUniversalTime()).ToUnixTimeSeconds();
+                builder.Append(domain).Append('\t')
+                    .Append(domain.StartsWith(".", StringComparison.Ordinal) ? "TRUE" : "FALSE").Append('\t')
+                    .Append(string.IsNullOrWhiteSpace(cookie.Path) ? "/" : cookie.Path).Append('\t')
+                    .Append(cookie.Secure ? "TRUE" : "FALSE").Append('\t')
+                    .Append(expires.ToString(CultureInfo.InvariantCulture)).Append('\t')
+                    .Append(cookie.Name).Append('\t').Append(cookie.Value).Append("\r\n");
+            }
+            var path = Path.Combine(Path.GetTempPath(), "LiveBoard-media-" + Guid.NewGuid().ToString("N") + ".txt");
+            File.WriteAllText(path, builder.ToString(), new UTF8Encoding(false));
+            return path;
+        }
+
         private static void AddCookieArguments(IList<string> arguments, string browser, string cookiePath)
         {
             if (!string.IsNullOrWhiteSpace(cookiePath))
@@ -1276,6 +1648,19 @@ namespace LiveBoard
                     arguments.Add("--cookies-from-browser");
                     arguments.Add(value);
                 }
+            }
+        }
+
+        private static void AddDouyinRequestArguments(IList<string> arguments, string platform, string referer)
+        {
+            if (!string.Equals(platform, "抖音", StringComparison.OrdinalIgnoreCase))
+                return;
+            arguments.Add("--user-agent");
+            arguments.Add(DouyinUserAgent);
+            if (!string.IsNullOrWhiteSpace(referer))
+            {
+                arguments.Add("--referer");
+                arguments.Add(referer);
             }
         }
 
@@ -1332,6 +1717,51 @@ namespace LiveBoard
             if (host == "x.com" || host.EndsWith(".x.com") || host.Contains("twitter.com")) return "X";
             if (host.Contains("instagram.com")) return "Instagram";
             return null;
+        }
+
+        private static bool IsHttpUrl(string value)
+        {
+            Uri uri;
+            return Uri.TryCreate(value, UriKind.Absolute, out uri) &&
+                   (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+        }
+
+        private static string GetDouyinImageHttpFallbackUrl(string value)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(value, UriKind.Absolute, out uri) || uri.Scheme != Uri.UriSchemeHttps ||
+                !(string.Equals(uri.Host, "douyinpic.com", StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith(".douyinpic.com", StringComparison.OrdinalIgnoreCase)))
+                return null;
+            var builder = new UriBuilder(uri) { Scheme = Uri.UriSchemeHttp, Port = -1 };
+            return builder.Uri.AbsoluteUri;
+        }
+
+        private static string GetDouyinMediaId(string url)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri))
+                return null;
+            var segments = uri.AbsolutePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            return segments.Length >= 2 ? segments[1] : null;
+        }
+
+        private static string SafeFileNamePart(string value)
+        {
+            value = string.IsNullOrWhiteSpace(value) ? "抖音图文" : value.Trim();
+            foreach (var character in Path.GetInvalidFileNameChars())
+                value = value.Replace(character, '_');
+            value = value.Trim(' ', '.');
+            if (value.Length > 60)
+                value = value.Substring(0, 60).TrimEnd(' ', '.');
+            return string.IsNullOrWhiteSpace(value) ? "抖音图文" : value;
+        }
+
+        private static string GetAvailableOutputPath(string directory, string stem, string extension)
+        {
+            var path = Path.Combine(directory, stem + "." + extension);
+            for (var suffix = 2; File.Exists(path); suffix++)
+                path = Path.Combine(directory, stem + " (" + suffix.ToString(CultureInfo.InvariantCulture) + ")." + extension);
+            return path;
         }
 
         private static MediaAnalysisResult Failure(string url, string message)
