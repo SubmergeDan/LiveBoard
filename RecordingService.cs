@@ -5,9 +5,11 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Reflection;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 
 namespace LiveBoard
 {
@@ -148,11 +150,11 @@ namespace LiveBoard
     public sealed class RecordingService
     {
         private const string BundledFfmpegResource = "LiveBoard.Resources.ffmpeg.exe";
+        private const string DouyinUserAgent = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.97 Safari/537.36 Core/1.116.567.400 QQBrowser/19.7.6764.400";
         private static readonly object FfmpegExtractionLock = new object();
-        private static readonly Regex StreamRegex = new Regex(
-            @"https?://[^""'\s<>\\]+(?:\.m3u8|\.flv)[^""'\s<>\\]*",
-            RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private readonly BilibiliService _bilibili;
+        private readonly CookieContainer _douyinCookies = new CookieContainer();
+        private readonly SemaphoreSlim _douyinSessionLock = new SemaphoreSlim(1, 1);
 
         public RecordingService(BilibiliService bilibili)
         {
@@ -368,103 +370,134 @@ namespace LiveBoard
 
         private async Task<RoomPageResult> FetchRoomPageAsync(string roomId, string quality, CancellationToken cancellationToken)
         {
-            var request = (HttpWebRequest)WebRequest.Create("https://live.douyin.com/" + roomId + "?_recording_helper=" + DateTime.UtcNow.Ticks);
-            request.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
-            request.Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
-            request.Referer = "https://live.douyin.com/";
-            request.CookieContainer = new CookieContainer();
+            await EnsureDouyinSessionAsync(cancellationToken);
+            var query = "aid=6383&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome&browser_version=116.0.0.0&web_rid=" + Uri.EscapeDataString(roomId.Trim()) + "&msToken=";
+            var api = "https://live.douyin.com/webcast/room/web/enter/?" + query + "&a_bogus=" + Uri.EscapeDataString(DouyinSignature.Sign(query, DouyinUserAgent));
+            var request = CreateDouyinRequest(api, "application/json, text/plain, */*");
+            request.Referer = "https://live.douyin.com/" + roomId;
+            using (var response = (HttpWebResponse)await request.GetResponseAsync())
+            using (var reader = new StreamReader(response.GetResponseStream()))
+            {
+                var json = await reader.ReadToEndAsync();
+                cancellationToken.ThrowIfCancellationRequested();
+                if (string.IsNullOrWhiteSpace(json))
+                    throw new InvalidOperationException("抖音拒绝了直播状态请求，请稍后重试。");
+                return ParseDouyinRoom(json, quality);
+            }
+        }
+
+        private async Task EnsureDouyinSessionAsync(CancellationToken cancellationToken)
+        {
+            if (_douyinCookies.GetCookies(new Uri("https://live.douyin.com/"))["ttwid"] != null)
+                return;
+            await _douyinSessionLock.WaitAsync(cancellationToken);
+            try
+            {
+                if (_douyinCookies.GetCookies(new Uri("https://live.douyin.com/"))["ttwid"] != null)
+                    return;
+                var request = CreateDouyinRequest("https://ttwid.bytedance.com/ttwid/union/register/", "application/json");
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                var payload = Encoding.UTF8.GetBytes("{\"region\":\"cn\",\"aid\":1768,\"needFid\":false,\"service\":\"www.douyin.com\",\"migrate_info\":{\"ticket\":\"\",\"source\":\"node\"},\"cbUrlProtocol\":\"https\",\"union\":true}");
+                request.ContentLength = payload.Length;
+                using (var stream = await request.GetRequestStreamAsync())
+                    await stream.WriteAsync(payload, 0, payload.Length, cancellationToken);
+
+                string registration;
+                using (var response = (HttpWebResponse)await request.GetResponseAsync())
+                using (var reader = new StreamReader(response.GetResponseStream()))
+                    registration = await reader.ReadToEndAsync();
+                cancellationToken.ThrowIfCancellationRequested();
+                var serializer = new JavaScriptSerializer();
+                var data = serializer.DeserializeObject(registration) as Dictionary<string, object>;
+                var callback = ReadString(data, "redirect_url");
+                Uri callbackUri;
+                if (!Uri.TryCreate(callback, UriKind.Absolute, out callbackUri) || !callbackUri.Host.EndsWith("douyin.com", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("无法建立抖音直播检测会话。");
+                using (var response = (HttpWebResponse)await CreateDouyinRequest(callbackUri.AbsoluteUri, "text/html,*/*").GetResponseAsync())
+                {
+                }
+                if (_douyinCookies.GetCookies(new Uri("https://live.douyin.com/"))["ttwid"] == null)
+                    throw new InvalidOperationException("无法建立抖音直播检测会话。");
+            }
+            finally
+            {
+                _douyinSessionLock.Release();
+            }
+        }
+
+        private HttpWebRequest CreateDouyinRequest(string url, string accept)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            request.UserAgent = DouyinUserAgent;
+            request.Accept = accept;
+            request.Headers[HttpRequestHeader.AcceptLanguage] = "zh-CN,zh;q=0.9";
+            request.CookieContainer = _douyinCookies;
             request.CachePolicy = new System.Net.Cache.RequestCachePolicy(System.Net.Cache.RequestCacheLevel.NoCacheNoStore);
             request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
             request.Timeout = 20000;
             request.ReadWriteTimeout = 20000;
-
-            using (var response = (HttpWebResponse)await request.GetResponseAsync())
-            using (var reader = new StreamReader(response.GetResponseStream()))
-            {
-                var html = await reader.ReadToEndAsync();
-                cancellationToken.ThrowIfCancellationRequested();
-                html = DecodePageText(WebUtility.HtmlDecode(html).Replace("\\u0026", "&").Replace("\\/", "/"));
-                var candidates = StreamRegex.Matches(html).Cast<Match>().Select(match => match.Value).Distinct().ToList();
-                return new RoomPageResult
-                {
-                    StreamUrl = ChooseQuality(candidates, quality),
-                    DisplayName = ExtractAnchorName(html),
-                    RoomTitle = ExtractRoomTitle(html)
-                };
-            }
+            return request;
         }
 
-        private string DecodePageText(string value)
+        private RoomPageResult ParseDouyinRoom(string json, string quality)
         {
-            value = Regex.Replace(value, @"\\u([0-9a-fA-F]{4})", delegate(Match match)
+            var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 200 };
+            var root = serializer.DeserializeObject(json) as Dictionary<string, object>;
+            var data = ReadDictionary(root, "data");
+            var rooms = data == null || !data.ContainsKey("data") ? null : data["data"] as object[];
+            if (rooms == null || rooms.Length == 0)
+                return new RoomPageResult();
+            var room = rooms[0] as Dictionary<string, object>;
+            if (room == null)
+                throw new InvalidOperationException("抖音返回了无法识别的直播状态。");
+
+            var user = ReadDictionary(data, "user") ?? ReadDictionary(room, "owner");
+            var result = new RoomPageResult
             {
-                return ((char)Convert.ToInt32(match.Groups[1].Value, 16)).ToString();
-            });
-            return value.Replace("\\\"", "\"");
+                DisplayName = CleanAnchorName(ReadString(user, "nickname")),
+                RoomTitle = CleanRoomTitle(ReadString(room, "title"))
+            };
+            int status;
+            if (!int.TryParse(ReadString(room, "status"), out status) || status != 2)
+                return result;
+
+            var stream = ReadDictionary(room, "stream_url");
+            result.StreamUrl = ChooseDouyinStream(stream, quality);
+            if (string.IsNullOrWhiteSpace(result.StreamUrl))
+                throw new InvalidOperationException("直播正在进行，但抖音没有返回可录制的视频流。");
+            return result;
         }
 
-        private string ExtractAnchorName(string html)
+        private string ChooseDouyinStream(Dictionary<string, object> stream, string quality)
         {
-            var ownerIndex = html.IndexOf("\"owner\"", StringComparison.OrdinalIgnoreCase);
-            if (ownerIndex >= 0)
-            {
-                var ownerSection = html.Substring(ownerIndex, Math.Min(12000, html.Length - ownerIndex));
-                var ownerName = FirstValidNickname(ownerSection);
-                if (!string.IsNullOrWhiteSpace(ownerName))
-                    return ownerName;
-            }
-
-            var nickname = FirstValidNickname(html);
-            if (!string.IsNullOrWhiteSpace(nickname))
-                return nickname;
-
-            var title = Regex.Match(html, @"<title[^>]*>(?<name>[^<]{1,160})</title>", RegexOptions.IgnoreCase);
-            return title.Success ? CleanAnchorName(title.Groups["name"].Value) : null;
-        }
-
-        private string ExtractRoomTitle(string html)
-        {
-            if (string.IsNullOrWhiteSpace(html))
+            if (stream == null)
                 return null;
-
-            // The page contains unrelated recommendation and advertising cards. Anchor the
-            // lookup to the room owner, which also provides the verified anchor nickname.
-            var ownerIndex = html.IndexOf("\"owner\"", StringComparison.OrdinalIgnoreCase);
-            if (ownerIndex < 0)
+            var urls = ReadDictionary(stream, "flv_pull_url");
+            if (urls == null || urls.Count == 0)
+                urls = ReadDictionary(stream, "hls_pull_url_map");
+            if (urls == null || urls.Count == 0)
                 return null;
-
-            var roomStart = html.LastIndexOf("\"room\"", ownerIndex, StringComparison.OrdinalIgnoreCase);
-            if (roomStart < 0 || ownerIndex - roomStart > 16000)
-                roomStart = Math.Max(0, ownerIndex - 12000);
-            var title = ExtractRoomTitleFromScope(html.Substring(roomStart, ownerIndex - roomStart), true);
-            if (!string.IsNullOrWhiteSpace(title))
-                return title;
-
-            var afterOwnerLength = Math.Min(4000, html.Length - ownerIndex);
-            return ExtractRoomTitleFromScope(html.Substring(ownerIndex, afterOwnerLength), false);
+            if (string.IsNullOrWhiteSpace(quality) || quality == "自动")
+            {
+                object preferred;
+                var defaultResolution = ReadString(stream, "default_resolution");
+                if (!string.IsNullOrWhiteSpace(defaultResolution) && urls.TryGetValue(defaultResolution, out preferred))
+                    return preferred as string;
+            }
+            return ChooseQuality(urls.Values.OfType<string>().ToList(), quality);
         }
 
-        private string ExtractRoomTitleFromScope(string scope, bool preferLast)
+        private static Dictionary<string, object> ReadDictionary(Dictionary<string, object> source, string key)
         {
-            var matches = Regex.Matches(scope, @"""(?:title|room_title)""\s*:\s*""(?<title>[^""]{1,240})""", RegexOptions.IgnoreCase);
-            if (preferLast)
-            {
-                for (var index = matches.Count - 1; index >= 0; index--)
-                {
-                    var title = CleanRoomTitle(matches[index].Groups["title"].Value);
-                    if (!string.IsNullOrWhiteSpace(title))
-                        return title;
-                }
-                return null;
-            }
+            object value;
+            return source != null && source.TryGetValue(key, out value) ? value as Dictionary<string, object> : null;
+        }
 
-            foreach (Match match in matches)
-            {
-                var title = CleanRoomTitle(match.Groups["title"].Value);
-                if (!string.IsNullOrWhiteSpace(title))
-                    return title;
-            }
-            return null;
+        private static string ReadString(Dictionary<string, object> source, string key)
+        {
+            object value;
+            return source != null && source.TryGetValue(key, out value) && value != null ? Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) : null;
         }
 
         private string CleanRoomTitle(string value)
@@ -484,18 +517,6 @@ namespace LiveBoard
                 value.Equals("广告投放", StringComparison.OrdinalIgnoreCase))
                 return null;
             return value;
-        }
-
-        private string FirstValidNickname(string html)
-        {
-            var matches = Regex.Matches(html, @"""nickname""\s*:\s*""(?<name>[^""]{1,80})""", RegexOptions.IgnoreCase);
-            foreach (Match match in matches)
-            {
-                var cleaned = CleanAnchorName(match.Groups["name"].Value);
-                if (!string.IsNullOrWhiteSpace(cleaned))
-                    return cleaned;
-            }
-            return null;
         }
 
         private string CleanAnchorName(string value)

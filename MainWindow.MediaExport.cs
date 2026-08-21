@@ -2,12 +2,14 @@ using System;
 using System.IO;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using Microsoft.Win32;
 using Forms = System.Windows.Forms;
 
 namespace LiveBoard
@@ -20,6 +22,13 @@ namespace LiveBoard
         private bool _mediaUrlPlaceholder = true;
         private bool _mediaProxyPlaceholder = true;
         private double _mediaProgressFloor;
+        private int _mediaProgressTotalAssets = 1;
+        private int _mediaCompletedAssets;
+        private double _mediaCurrentPercent;
+        private bool _mediaPostProcessing;
+        private string _mediaLastSpeed;
+        private string _mediaLastEta;
+        private string _mediaFailureLog;
 
         private void InitializeMediaWorkspace()
         {
@@ -77,6 +86,7 @@ namespace LiveBoard
             }
 
             _mediaAnalysis = null;
+            _mediaFailureLog = null;
             MediaAssetItems.ItemsSource = null;
             MediaAssetItems.Visibility = Visibility.Collapsed;
             MediaQualityCombo.ItemsSource = null;
@@ -107,7 +117,7 @@ namespace LiveBoard
                 }
                 if (!result.Success)
                 {
-                    SetMediaStatus("解析失败", result.ErrorText, "失败", "!", FindBrush("OrangeBrush"));
+                    SetMediaFailureStatus("解析失败", result.ErrorText, null, input);
                     MediaAnalyzeStateText.Text = "解析失败";
                     return;
                 }
@@ -144,7 +154,7 @@ namespace LiveBoard
             }
             catch (Exception ex)
             {
-                SetMediaStatus("解析失败", ShortenStatus(ex.Message), "失败", "!", FindBrush("OrangeBrush"));
+                SetMediaFailureStatus("解析失败", ShortenStatus(ex.Message), ex.ToString(), input);
             }
             finally
             {
@@ -166,14 +176,21 @@ namespace LiveBoard
             }
             catch (Exception ex)
             {
-                SetMediaStatus("保存位置不可用", ShortenStatus(ex.Message), "失败", "!", FindBrush("OrangeBrush"));
+                SetMediaFailureStatus("保存位置不可用", ShortenStatus(ex.Message), ex.ToString());
                 return;
             }
 
             var format = MediaQualityCombo.SelectedItem as MediaFormatOption;
             var cancellation = new CancellationTokenSource();
             _mediaCancellation = cancellation;
+            _mediaFailureLog = null;
             _mediaProgressFloor = 0;
+            _mediaProgressTotalAssets = Math.Max(1, _mediaAnalysis.AssetCount);
+            _mediaCompletedAssets = 0;
+            _mediaCurrentPercent = 0;
+            _mediaPostProcessing = false;
+            _mediaLastSpeed = null;
+            _mediaLastEta = null;
             SetMediaBusy(true, "导出中");
                 SetMediaStatus("正在导出媒体", _mediaAnalysis.Title, "导出中", "…", FindBrush("BrightGreenBrush"));
             try
@@ -194,8 +211,17 @@ namespace LiveBoard
                 }
                 if (!result.Success)
                 {
-                    SetMediaStatus("导出失败", result.ErrorText, "失败", "!", FindBrush("OrangeBrush"));
+                    SetMediaFailureStatus("导出失败", result.ErrorText, result.LogText);
                     AddActivity("媒体导出失败", ShortenStatus(result.ErrorText));
+                    return;
+                }
+                if (result.PartialSuccess)
+                {
+                    var total = Math.Max(result.DownloadedCount, _mediaAnalysis.AssetCount);
+                    MediaProgressBar.IsIndeterminate = false;
+                    MediaProgressBar.Value = 100d * result.DownloadedCount / total;
+                    SetMediaPartialStatus(result.DownloadedCount, total, result.ErrorText, result.LogText);
+                    AddActivity("媒体部分导出完成", result.DownloadedCount + "/" + total + " 个文件已保存");
                     return;
                 }
                 MediaProgressBar.IsIndeterminate = false;
@@ -209,7 +235,7 @@ namespace LiveBoard
             }
             catch (Exception ex)
             {
-                SetMediaStatus("导出失败", ShortenStatus(ex.Message), "失败", "!", FindBrush("OrangeBrush"));
+                SetMediaFailureStatus("导出失败", ShortenStatus(ex.Message), ex.ToString());
             }
             finally
             {
@@ -248,6 +274,29 @@ namespace LiveBoard
         private void OpenMediaFolder_OnClick(object sender, RoutedEventArgs e)
         {
             OpenFolderInExplorer(GetMediaOutputDirectory(), "媒体保存文件夹");
+        }
+
+        private void ExportMediaLog_OnClick(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(_mediaFailureLog))
+                return;
+            var dialog = new SaveFileDialog
+            {
+                Filter = "文本日志 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+                FileName = "LiveBoard-media-error-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt",
+                Title = "导出媒体失败日志"
+            };
+            if (dialog.ShowDialog() != true)
+                return;
+            try
+            {
+                File.WriteAllText(dialog.FileName, _mediaFailureLog, new UTF8Encoding(false));
+                AddActivity("已导出媒体失败日志", Path.GetFileName(dialog.FileName));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("失败日志无法写入：" + ex.Message, "导出日志失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
 
         private void MediaUrl_OnGotFocus(object sender, RoutedEventArgs e)
@@ -357,7 +406,16 @@ namespace LiveBoard
                     return;
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
-                    if (line.StartsWith("__RH_PROGRESS__", StringComparison.OrdinalIgnoreCase))
+                    if (line.StartsWith("__RH_OUTPUT__", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _mediaCompletedAssets = Math.Min(_mediaProgressTotalAssets, _mediaCompletedAssets + 1);
+                        _mediaCurrentPercent = 0;
+                        _mediaPostProcessing = false;
+                        _mediaLastSpeed = null;
+                        _mediaLastEta = null;
+                        SetMediaProgress(0, null, null);
+                    }
+                    else if (line.StartsWith("__RH_PROGRESS__", StringComparison.OrdinalIgnoreCase))
                     {
                         var value = line.Substring("__RH_PROGRESS__".Length).Trim();
                         double percent;
@@ -369,6 +427,7 @@ namespace LiveBoard
                         }
                         else
                         {
+                            _mediaPostProcessing = false;
                             MediaProgressBar.IsIndeterminate = true;
                             MediaProgressBar.Visibility = Visibility.Visible;
                             MediaProgressText.Text = "处理中";
@@ -378,12 +437,22 @@ namespace LiveBoard
                     }
                     else
                     {
-                        var percentMatch = Regex.Match(line, @"(?<percent>[0-9]+(?:[\.,][0-9]+)?)\s*%", RegexOptions.CultureInvariant);
                         double percent;
-                        if (percentMatch.Success && double.TryParse(percentMatch.Groups["percent"].Value.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out percent))
-                            SetMediaProgress(percent, null, null);
+                        string speed;
+                        string eta;
+                        if (TryReadMediaProgress(line, out percent, out speed, out eta))
+                        {
+                            _mediaPostProcessing = false;
+                            SetMediaProgress(percent, speed, eta);
+                        }
+                        else if (IsMediaPostProcessingLine(line))
+                        {
+                            _mediaPostProcessing = true;
+                            SetMediaProgress(_mediaCurrentPercent, null, null);
+                        }
                         else if (line.IndexOf("Downloading", StringComparison.OrdinalIgnoreCase) >= 0 || line.IndexOf("下载", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
+                            _mediaPostProcessing = false;
                             MediaProgressBar.IsIndeterminate = true;
                             MediaProgressBar.Visibility = Visibility.Visible;
                             MediaProgressText.Text = "处理中";
@@ -397,16 +466,54 @@ namespace LiveBoard
         private void SetMediaProgress(double percent, string speed, string eta)
         {
             var normalizedPercent = Math.Max(0, Math.Min(99.9, percent));
-            _mediaProgressFloor = Math.Max(_mediaProgressFloor, normalizedPercent);
+            _mediaCurrentPercent = normalizedPercent;
+            var totalAssets = Math.Max(1, _mediaProgressTotalAssets);
+            var aggregatePercent = (100d * (_mediaCompletedAssets + normalizedPercent / 100d)) / totalAssets;
+            if (_mediaCompletedAssets >= totalAssets)
+                aggregatePercent = 100;
+            _mediaProgressFloor = Math.Max(_mediaProgressFloor, Math.Min(99.9, aggregatePercent));
             MediaProgressBar.IsIndeterminate = false;
             MediaProgressBar.Visibility = Visibility.Visible;
             MediaProgressBar.Value = _mediaProgressFloor;
             MediaProgressText.Text = _mediaProgressFloor.ToString("0.#", CultureInfo.InvariantCulture) + "%";
             MediaTaskStateText.Text = MediaProgressText.Text;
-            var detail = new[] { NormalizeMediaSpeed(speed), NormalizeMediaEta(eta) }
+            var speedText = NormalizeMediaSpeed(speed);
+            var etaText = NormalizeMediaEta(eta);
+            if (_mediaPostProcessing)
+            {
+                _mediaLastSpeed = null;
+                _mediaLastEta = null;
+            }
+            else
+            {
+                if (!string.IsNullOrWhiteSpace(speedText))
+                    _mediaLastSpeed = speedText;
+                else
+                    speedText = _mediaLastSpeed;
+                if (!string.IsNullOrWhiteSpace(etaText))
+                    _mediaLastEta = etaText;
+                else
+                    etaText = _mediaLastEta;
+            }
+            if (_mediaProgressTotalAssets > 1 && !string.IsNullOrWhiteSpace(etaText))
+                etaText = "当前媒体" + etaText;
+            var detail = (_mediaPostProcessing
+                ? new[] { "正在封装媒体" }
+                : new[] { speedText, etaText })
                 .Where(part => !string.IsNullOrWhiteSpace(part))
                 .ToArray();
             MediaStatusDetailText.Text = detail.Length > 0 ? string.Join(" · ", detail) : "正在接收媒体数据";
+        }
+
+        private static bool IsMediaPostProcessingLine(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                return false;
+            return line.IndexOf("Merging", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   line.IndexOf("Post-process", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   line.IndexOf("Remux", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   line.IndexOf("Fixing", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   line.IndexOf("Deleting original", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static string NormalizeMediaSpeed(string value)
@@ -446,25 +553,40 @@ namespace LiveBoard
             long downloaded;
             long total;
             long estimate;
-            if (parts.Length >= 6 && long.TryParse(parts[0].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out downloaded))
+            if (parts.Length >= 6)
             {
-                long.TryParse(parts[1].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out total);
-                long.TryParse(parts[2].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out estimate);
-                var knownTotal = total > 0 ? total : estimate;
-                if (knownTotal > 0)
+                speed = parts[4].Trim();
+                eta = parts[5].Trim();
+                if (long.TryParse(parts[0].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out downloaded))
                 {
-                    percent = 100d * downloaded / knownTotal;
-                    speed = parts[4].Trim();
-                    eta = parts[5].Trim();
-                    return true;
+                    long.TryParse(parts[1].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out total);
+                    long.TryParse(parts[2].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out estimate);
+                    var knownTotal = total > 0 ? total : estimate;
+                    if (knownTotal > 0)
+                    {
+                        percent = 100d * downloaded / knownTotal;
+                        return true;
+                    }
                 }
             }
 
             var percentMatch = Regex.Match(value ?? string.Empty, @"(?<percent>[0-9]+(?:[\.,][0-9]+)?)\s*%", RegexOptions.CultureInvariant);
             if (!percentMatch.Success || !double.TryParse(percentMatch.Groups["percent"].Value.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out percent))
                 return false;
-            speed = parts.Length > 1 ? parts[1].Trim() : null;
-            eta = parts.Length > 2 ? parts[2].Trim() : null;
+            if (parts.Length >= 3 && parts.Length < 6)
+            {
+                speed = parts[1].Trim();
+                eta = parts[2].Trim();
+            }
+            else if (parts.Length < 6)
+            {
+                var detailMatch = Regex.Match(value ?? string.Empty, @"\bat\s+(?<speed>\S+)\s+ETA\s+(?<eta>\S+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                if (detailMatch.Success)
+                {
+                    speed = detailMatch.Groups["speed"].Value;
+                    eta = detailMatch.Groups["eta"].Value;
+                }
+            }
             return true;
         }
 
@@ -503,6 +625,46 @@ namespace LiveBoard
             MediaStatusDot.Background = brush;
             MediaSidebarDot.Background = brush;
             MediaSidebarStateText.Text = title;
+            MediaExportLogButton.Visibility = (string.Equals(taskState, "失败", StringComparison.Ordinal) || string.Equals(taskState, "部分完成", StringComparison.Ordinal)) && !string.IsNullOrWhiteSpace(_mediaFailureLog)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        private void SetMediaFailureStatus(string title, string detail, string rawLog, string sourceUrl = null)
+        {
+            _mediaFailureLog = BuildMediaFailureLog(title, detail, rawLog, sourceUrl);
+            SetMediaStatus(title, detail, "失败", "!", FindBrush("OrangeBrush"));
+        }
+
+        private void SetMediaPartialStatus(int completed, int total, string detail, string rawLog)
+        {
+            var summary = "已保存 " + completed + "/" + total + " 个媒体，其余媒体下载失败";
+            _mediaFailureLog = BuildMediaFailureLog("部分导出完成", detail, rawLog);
+            SetMediaStatus("部分导出完成", summary, "部分完成", "!", FindBrush("OrangeBrush"));
+        }
+
+        private string BuildMediaFailureLog(string stage, string detail, string rawLog, string sourceUrl = null)
+        {
+            var analysis = _mediaAnalysis;
+            var builder = new StringBuilder();
+            builder.AppendLine("LiveBoard 媒体导出失败日志");
+            builder.AppendLine("时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            builder.AppendLine("阶段: " + (stage ?? "未知"));
+            builder.AppendLine("平台: " + (analysis == null ? "未知" : analysis.Platform ?? "未知"));
+            builder.AppendLine("引擎: " + (analysis == null ? "未知" : analysis.Engine ?? "未知"));
+            builder.AppendLine("标题: " + (analysis == null ? "未知" : analysis.Title ?? "未知"));
+            builder.AppendLine("地址: " + (sourceUrl ?? (analysis == null ? null : analysis.Url) ?? "未知"));
+            builder.AppendLine("保存目录: " + GetMediaOutputDirectory());
+            builder.AppendLine();
+            builder.AppendLine("界面错误:");
+            builder.AppendLine(detail ?? "未提供错误信息");
+            if (!string.IsNullOrWhiteSpace(rawLog))
+            {
+                builder.AppendLine();
+                builder.AppendLine("原始工具输出:");
+                builder.AppendLine(rawLog.Trim());
+            }
+            return builder.ToString();
         }
 
         private void CancelMediaWork()

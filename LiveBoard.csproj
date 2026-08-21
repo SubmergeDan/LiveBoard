@@ -81,6 +81,7 @@
     <Compile Include="Models.cs" />
     <Compile Include="ConfigStore.cs" />
     <Compile Include="RecordingService.cs" />
+    <Compile Include="DouyinSignature.cs" />
     <Compile Include="BilibiliService.cs" />
     <Compile Include="M4sMuxService.cs" />
     <Compile Include="MediaExportService.cs" />

@@ -69,8 +69,10 @@ namespace LiveBoard
     public sealed class MediaExportResult
     {
         public bool Success { get; set; }
+        public bool PartialSuccess { get; set; }
         public bool Cancelled { get; set; }
         public string ErrorText { get; set; }
+        public string LogText { get; set; }
         public string OutputDirectory { get; set; }
         public int DownloadedCount { get; set; }
     }
@@ -135,7 +137,7 @@ namespace LiveBoard
                 if (string.Equals(platform, "网页", StringComparison.OrdinalIgnoreCase))
                 {
                     var page = await AnalyzeGenericWebPageAsync(url, effectiveProxy, cancellationToken, progress);
-                    if (page.Success && page.AssetCount > 1)
+                    if (page.Success && page.AssetCount > 0)
                         return page;
 
                     var ytDlp = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
@@ -197,13 +199,33 @@ namespace LiveBoard
                     {
                         "--ignore-config", "--no-warnings", "--playlist-end", MaxPageMediaAssets.ToString(CultureInfo.InvariantCulture), "--no-colors", "--newline",
                         "--encoding", "utf-8", "--socket-timeout", "30", "--ffmpeg-location", Path.GetDirectoryName(ffmpegPath),
+                        "--windows-filenames", "--trim-filenames", "120",
                         "--no-mtime", "--no-overwrites", "--merge-output-format", "mp4",
                         "--progress", "--progress-delta", "0.2",
                         "--progress-template", "download:__RH_PROGRESS__%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
                         "--print", "after_move:__RH_OUTPUT__%(filepath)s", "-P", outputDirectory,
-                        "-o", "%(autonumber)03d_%(title).160B_%(id)s.%(ext)s"
+                        "-o", "%(autonumber)03d_%(title).80B_%(id).32B.%(ext)s"
                     };
-                    AddCookieArguments(arguments, cookieBrowser, cookiePath);
+                    // Direct page assets are already resolved to media URLs. Reading a
+                    // browser cookie database here can fail while the browser is open and
+                    // is unnecessary for public direct streams.
+                    if (!string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase))
+                        AddCookieArguments(arguments, cookieBrowser, cookiePath);
+                    if (string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(analysis.Url))
+                    {
+                        arguments.Add("--ignore-errors");
+                        arguments.Add("--continue");
+                        arguments.Add("--retries");
+                        arguments.Add("20");
+                        arguments.Add("--fragment-retries");
+                        arguments.Add("20");
+                        arguments.Add("--retry-sleep");
+                        arguments.Add("1");
+                        arguments.Add("--http-chunk-size");
+                        arguments.Add("10M");
+                        arguments.Add("--referer");
+                        arguments.Add(analysis.Url);
+                    }
                     AddProxyArgument(arguments, effectiveProxy);
                     if (!string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase))
                     {
@@ -219,11 +241,29 @@ namespace LiveBoard
 
                 if (run.Cancelled || cancellationToken.IsCancellationRequested)
                     return new MediaExportResult { Cancelled = true, OutputDirectory = outputDirectory };
-                if (run.ExitCode != 0)
-                    return new MediaExportResult { ErrorText = MapError(run.StandardError, analysis.Platform), OutputDirectory = outputDirectory };
-
                 var after = SafeFileCount(outputDirectory);
-                var count = Math.Max(0, after - before);
+                var count = Math.Max(Math.Max(0, after - before), CountCompletedOutputs(run.StandardOutput));
+                if (count > 0 && (run.ExitCode != 0 || HasToolErrors(run.StandardError)))
+                {
+                    return new MediaExportResult
+                    {
+                        Success = true,
+                        PartialSuccess = true,
+                        ErrorText = MapError(run.StandardError, analysis.Platform),
+                        LogText = BuildToolLog(run),
+                        OutputDirectory = outputDirectory,
+                        DownloadedCount = count
+                    };
+                }
+                if (run.ExitCode != 0)
+                {
+                    return new MediaExportResult
+                    {
+                        ErrorText = MapError(run.StandardError, analysis.Platform),
+                        LogText = BuildToolLog(run),
+                        OutputDirectory = outputDirectory
+                    };
+                }
                 return new MediaExportResult
                 {
                     Success = true,
@@ -237,7 +277,12 @@ namespace LiveBoard
             }
             catch (Exception ex)
             {
-                return new MediaExportResult { ErrorText = MapError(ex.Message, analysis.Platform), OutputDirectory = outputDirectory };
+                return new MediaExportResult
+                {
+                    ErrorText = MapError(ex.Message, analysis.Platform),
+                    LogText = ex.ToString(),
+                    OutputDirectory = outputDirectory
+                };
             }
             finally
             {
@@ -986,8 +1031,42 @@ namespace LiveBoard
             }
             if (value.IndexOf("empty media response", StringComparison.OrdinalIgnoreCase) >= 0 || value.IndexOf("redirect to login", StringComparison.OrdinalIgnoreCase) >= 0)
                 return platform + " 当前需要登录或受到地区限制，请选择浏览器登录状态并保持代理可用。";
+            if (value.IndexOf("IncompleteRead", StringComparison.OrdinalIgnoreCase) >= 0 || value.IndexOf("more expected", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "媒体服务器提前中断了数据传输；LiveBoard 已自动续传重试，仍未完成的媒体可稍后再次导出。";
             if (value.Length == 0) return "平台没有返回可下载的媒体。";
             return value.Length > 220 ? value.Substring(0, 220) + "…" : value;
+        }
+
+        private static string BuildToolLog(MediaToolResult run)
+        {
+            if (run == null)
+                return string.Empty;
+            var builder = new StringBuilder();
+            if (!string.IsNullOrWhiteSpace(run.StandardError))
+            {
+                builder.AppendLine("[stderr]");
+                builder.AppendLine(run.StandardError.Trim());
+            }
+            if (!string.IsNullOrWhiteSpace(run.StandardOutput))
+            {
+                if (builder.Length > 0)
+                    builder.AppendLine();
+                builder.AppendLine("[stdout]");
+                builder.AppendLine(run.StandardOutput.Trim());
+            }
+            builder.AppendLine();
+            builder.AppendLine("退出码: " + run.ExitCode.ToString(CultureInfo.InvariantCulture));
+            return builder.ToString().Trim();
+        }
+
+        private static int CountCompletedOutputs(string output)
+        {
+            return Regex.Matches(output ?? string.Empty, @"(?m)^__RH_OUTPUT__").Count;
+        }
+
+        private static bool HasToolErrors(string error)
+        {
+            return Regex.IsMatch(error ?? string.Empty, @"(?m)^ERROR:");
         }
 
         private static string GetDownloadUrl(MediaAnalysisResult analysis)
