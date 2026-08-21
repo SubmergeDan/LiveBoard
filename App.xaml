@@ -182,6 +182,84 @@
             </Setter>
         </Style>
 
+        <Style x:Key="MediaItemCheckBox" TargetType="CheckBox">
+            <Setter Property="Width" Value="24" />
+            <Setter Property="Height" Value="24" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="ToolTip" Value="选择此媒体" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Border x:Name="SelectionButton" Background="#E7ECE8" BorderBrush="#D8DED9" BorderThickness="1" CornerRadius="6" SnapsToDevicePixels="True">
+                            <Canvas Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <Path x:Name="SelectionCheck" Data="M2,7 L5.5,10.5 L12,3.5" Stroke="White" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Visibility="Collapsed" />
+                            </Canvas>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="SelectionButton" Property="Background" Value="#DCE5DF" />
+                                <Setter TargetName="SelectionButton" Property="BorderBrush" Value="#C8D4CC" />
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True">
+                                <Setter TargetName="SelectionButton" Property="BorderBrush" Value="{StaticResource GreenBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="SelectionButton" Property="Background" Value="{StaticResource GreenBrush}" />
+                                <Setter TargetName="SelectionButton" Property="BorderBrush" Value="{StaticResource GreenBrush}" />
+                                <Setter TargetName="SelectionCheck" Property="Visibility" Value="Visible" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="SelectionButton" Property="Opacity" Value="0.5" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="MediaSelectAllCheckBox" TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
+            <Setter Property="FontSize" Value="10" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Border x:Name="SelectAllButton" Background="#F5F7F4" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="8" Padding="8,5">
+                            <StackPanel Orientation="Horizontal">
+                                <Border x:Name="SelectAllBox" Width="14" Height="14" CornerRadius="4" Background="#E1E7E2" BorderBrush="#CDD5CF" BorderThickness="1">
+                                    <Viewbox Width="9" Height="9" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <Path x:Name="SelectAllCheck" Data="M2,7 L5.4,10.1 L12,3.5" Stroke="White" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Visibility="Collapsed" />
+                                    </Viewbox>
+                                </Border>
+                                <ContentPresenter Margin="6,0,0,0" VerticalAlignment="Center" />
+                            </StackPanel>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="SelectAllButton" Property="Background" Value="#EDF2EE" />
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True">
+                                <Setter TargetName="SelectAllButton" Property="BorderBrush" Value="{StaticResource GreenBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="SelectAllButton" Property="Background" Value="{StaticResource MintBrush}" />
+                                <Setter TargetName="SelectAllButton" Property="BorderBrush" Value="#C9E5D8" />
+                                <Setter TargetName="SelectAllBox" Property="Background" Value="{StaticResource GreenBrush}" />
+                                <Setter TargetName="SelectAllBox" Property="BorderBrush" Value="{StaticResource GreenBrush}" />
+                                <Setter TargetName="SelectAllCheck" Property="Visibility" Value="Visible" />
+                                <Setter Property="Foreground" Value="{StaticResource GreenBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="SelectAllButton" Property="Opacity" Value="0.5" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style x:Key="IconButton" TargetType="Button">
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />

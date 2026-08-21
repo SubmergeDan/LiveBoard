@@ -622,9 +622,12 @@
                                         <TextBlock Text="解析结果" Foreground="{StaticResource InkBrush}" FontSize="19" FontWeight="Medium" />
                                         <TextBlock x:Name="MediaPlatformText" Text="" Foreground="{StaticResource MutedBrush}" FontSize="12" VerticalAlignment="Center" Margin="9,1,0,0" />
                                     </StackPanel>
-                                    <Border x:Name="MediaCountBadge" Background="{StaticResource MintBrush}" CornerRadius="8" Padding="8,4" HorizontalAlignment="Right" VerticalAlignment="Center" Visibility="Collapsed">
-                                        <TextBlock x:Name="MediaCountText" Text="" Foreground="{StaticResource GreenBrush}" FontSize="10" VerticalAlignment="Center" />
-                                    </Border>
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                                        <CheckBox x:Name="MediaSelectAllCheckBox" Content="全选" Style="{StaticResource MediaSelectAllCheckBox}" Visibility="Collapsed" VerticalAlignment="Center" Margin="0,0,10,0" Click="MediaSelectAll_OnClick" />
+                                        <Border x:Name="MediaCountBadge" Background="{StaticResource MintBrush}" CornerRadius="8" Padding="8,4" Visibility="Collapsed">
+                                            <TextBlock x:Name="MediaCountText" Text="" Foreground="{StaticResource GreenBrush}" FontSize="10" VerticalAlignment="Center" />
+                                        </Border>
+                                    </StackPanel>
                                 </Grid>
                                 <TextBlock x:Name="MediaTitleText" Text="尚未解析媒体" Foreground="{StaticResource InkBrush}" FontSize="14" FontWeight="Medium" TextTrimming="CharacterEllipsis" />
                                 <TextBlock x:Name="MediaUrlSummaryText" Text="" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,4,0,12" TextTrimming="CharacterEllipsis" />
@@ -634,18 +637,25 @@
                                             <Border Background="#F7F8F5" CornerRadius="10" Padding="10" Margin="0,0,0,6">
                                                 <Grid>
                                                     <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="34" />
+                                                        <ColumnDefinition Width="28" />
+                                                        <ColumnDefinition Width="58" />
                                                         <ColumnDefinition Width="*" />
                                                         <ColumnDefinition Width="Auto" />
                                                     </Grid.ColumnDefinitions>
-                                                    <Border Width="24" Height="24" CornerRadius="12" Background="#E1E9E3">
+                                                    <Border Width="22" Height="22" CornerRadius="11" Background="#E1E9E3" VerticalAlignment="Center">
                                                         <TextBlock Text="{Binding Index}" Foreground="{StaticResource GreenBrush}" FontSize="10" HorizontalAlignment="Center" VerticalAlignment="Center" />
                                                     </Border>
-                                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                                        <TextBlock Text="{Binding Type}" Foreground="{StaticResource InkBrush}" FontSize="11" />
-                                                        <TextBlock Text="{Binding Summary}" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,2,0,0" />
+                                                    <Border Grid.Column="1" Width="50" Height="50" CornerRadius="6" Background="#E1E9E3" ClipToBounds="True" VerticalAlignment="Center">
+                                                        <Grid>
+                                                            <TextBlock Text="{Binding Type}" Foreground="{StaticResource GreenBrush}" FontSize="10" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                                            <Image Source="{Binding ThumbnailUrl}" Stretch="UniformToFill" />
+                                                        </Grid>
+                                                    </Border>
+                                                    <StackPanel Grid.Column="2" VerticalAlignment="Center" Margin="4,0,12,0">
+                                                        <TextBlock Text="{Binding DisplayType}" Foreground="{StaticResource InkBrush}" FontSize="11" FontWeight="Medium" TextTrimming="CharacterEllipsis" />
+                                                        <TextBlock Text="{Binding Summary}" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" />
                                                     </StackPanel>
-                                                    <TextBlock Grid.Column="2" Text="{Binding Extension}" Foreground="{StaticResource MutedBrush}" FontSize="10" VerticalAlignment="Center" />
+                                                    <CheckBox Grid.Column="3" Style="{StaticResource MediaItemCheckBox}" IsChecked="{Binding IsSelected, Mode=TwoWay}" VerticalAlignment="Center" Click="MediaAssetSelection_OnClick" />
                                                 </Grid>
                                             </Border>
                                         </DataTemplate>

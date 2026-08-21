@@ -8,6 +8,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -37,13 +38,71 @@ namespace LiveBoard
         public string Url { get; set; }
         public int Width { get; set; }
         public int Height { get; set; }
+        public long FileSize { get; set; }
+        public bool FileSizeIsEstimated { get; set; }
+        public double DurationSeconds { get; set; }
+        public string ThumbnailUrl { get; set; }
+        public string Codec { get; set; }
+        public bool IsSelected { get; set; }
+
+        public MediaAssetInfo()
+        {
+            IsSelected = true;
+        }
+
+        public string DisplayType
+        {
+            get
+            {
+                var format = string.Equals(Extension, "m3u8", StringComparison.OrdinalIgnoreCase) ? "HLS" :
+                             string.Equals(Extension, "mpd", StringComparison.OrdinalIgnoreCase) ? "DASH" :
+                             string.IsNullOrWhiteSpace(Extension) ? null : Extension.ToUpperInvariant();
+                return string.Join(" · ", new[] { Type ?? "媒体", format, Codec }
+                    .Where(value => !string.IsNullOrWhiteSpace(value)).ToArray());
+            }
+        }
+
         public string Summary
         {
             get
             {
-                var dimensions = Width > 0 && Height > 0 ? " · " + Width + "×" + Height : string.Empty;
-                return (Type ?? "媒体") + dimensions;
+                var details = new List<string>();
+                if (Width > 0 && Height > 0)
+                    details.Add(Width + "×" + Height);
+                if (FileSize > 0)
+                    details.Add((FileSizeIsEstimated ? "约 " : string.Empty) + FormatFileSize(FileSize));
+                if (string.Equals(Type, "视频", StringComparison.OrdinalIgnoreCase) || IsVideoExtension(Extension))
+                {
+                    if (DurationSeconds > 0)
+                        details.Add(FormatDuration(DurationSeconds));
+                }
+                return string.Join(" · ", details.ToArray());
             }
+        }
+
+        private static string FormatFileSize(long bytes)
+        {
+            var value = (double)bytes;
+            var units = new[] { "B", "KB", "MB", "GB", "TB" };
+            var unit = 0;
+            while (value >= 1024 && unit < units.Length - 1)
+            {
+                value /= 1024;
+                unit++;
+            }
+            return value.ToString(value >= 100 || unit == 0 ? "0" : "0.#", CultureInfo.InvariantCulture) + " " + units[unit];
+        }
+
+        private static string FormatDuration(double seconds)
+        {
+            var duration = TimeSpan.FromSeconds(Math.Max(0, seconds));
+            return duration.TotalHours >= 1 ? duration.ToString(@"h\:mm\:ss") : duration.ToString(@"m\:ss");
+        }
+
+        private static bool IsVideoExtension(string extension)
+        {
+            return new[] { "mp4", "webm", "mov", "m3u8", "mpd", "flv", "mkv" }
+                .Contains(extension ?? string.Empty, StringComparer.OrdinalIgnoreCase);
         }
     }
 
@@ -162,10 +221,13 @@ namespace LiveBoard
             }
         }
 
-        public async Task<MediaExportResult> ExportAsync(MediaAnalysisResult analysis, MediaFormatOption format, string outputDirectory, string cookieBrowser, string proxy, string bilibiliCookies, CancellationToken cancellationToken, Action<string> progress)
+        public async Task<MediaExportResult> ExportAsync(MediaAnalysisResult analysis, IList<MediaAssetInfo> selectedAssets, MediaFormatOption format, string outputDirectory, string cookieBrowser, string proxy, string bilibiliCookies, CancellationToken cancellationToken, Action<string> progress)
         {
             if (analysis == null || !analysis.Success)
                 return new MediaExportResult { ErrorText = "还没有可导出的媒体。" };
+            selectedAssets = (selectedAssets ?? new List<MediaAssetInfo>()).Where(asset => asset != null).ToList();
+            if (selectedAssets.Count == 0)
+                return new MediaExportResult { ErrorText = "请至少选择一个媒体。" };
             if (string.IsNullOrWhiteSpace(outputDirectory))
                 outputDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
             Directory.CreateDirectory(outputDirectory);
@@ -173,7 +235,7 @@ namespace LiveBoard
             string cookiePath = null;
             try
             {
-                var effectiveProxy = ResolveProxy(proxy, GetDownloadUrl(analysis));
+                var effectiveProxy = ResolveProxy(proxy, GetDownloadUrl(analysis, selectedAssets));
                 cookiePath = CreateCookieFile(bilibiliCookies, string.Equals(analysis.Platform, "Bilibili", StringComparison.OrdinalIgnoreCase));
                 var before = SafeFileCount(outputDirectory);
                 MediaToolResult run;
@@ -183,11 +245,11 @@ namespace LiveBoard
                     var arguments = new List<string>
                     {
                         "--config-ignore", "--no-input", "--no-colors", "--windows-filenames", "--no-mtime",
-                        "--range", "1-1000", "--directory", outputDirectory
+                        "--range", BuildItemSelection(selectedAssets), "--Print", "after:__RH_OUTPUT__", "--directory", outputDirectory
                     };
                     AddCookieArguments(arguments, cookieBrowser, cookiePath);
                     AddProxyArgument(arguments, effectiveProxy);
-                    arguments.Add(GetDownloadUrl(analysis));
+                    arguments.Add(analysis.Url);
                     ReportProgress(progress, "正在下载帖子媒体");
                     run = await RunToolAsync(galleryPath, arguments, cancellationToken, progress);
                 }
@@ -227,13 +289,18 @@ namespace LiveBoard
                         arguments.Add(analysis.Url);
                     }
                     AddProxyArgument(arguments, effectiveProxy);
+                    if (!string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase) && analysis.AssetCount > 1)
+                    {
+                        arguments.Add("--playlist-items");
+                        arguments.Add(BuildItemSelection(selectedAssets));
+                    }
                     if (!string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase))
                     {
                         var selector = format == null || string.IsNullOrWhiteSpace(format.Selector) ? "bestvideo+bestaudio/best" : format.Selector;
                         arguments.Add("-f");
                         arguments.Add(selector);
                     }
-                    foreach (var downloadUrl in GetDownloadUrls(analysis))
+                    foreach (var downloadUrl in GetDownloadUrls(analysis, selectedAssets))
                         arguments.Add(downloadUrl);
                     ReportProgress(progress, "正在下载视频");
                     run = await RunToolAsync(ytPath, arguments, cancellationToken, progress);
@@ -268,7 +335,7 @@ namespace LiveBoard
                 {
                     Success = true,
                     OutputDirectory = outputDirectory,
-                    DownloadedCount = count > 0 ? count : Math.Max(1, analysis.AssetCount)
+                    DownloadedCount = count > 0 ? count : selectedAssets.Count
                 };
             }
             catch (OperationCanceledException)
@@ -313,7 +380,7 @@ namespace LiveBoard
             try
             {
                 ReportProgress(progress, "正在展开抖音分享链接");
-                using (var handler = new HttpClientHandler { AllowAutoRedirect = true })
+                using (var handler = new HttpClientHandler { AllowAutoRedirect = true, MaxConnectionsPerServer = 8 })
                 {
                     if (!string.IsNullOrWhiteSpace(proxy))
                     {
@@ -436,14 +503,19 @@ namespace LiveBoard
 
         private static MediaAssetInfo CreateYtDlpAsset(Dictionary<string, object> values, int index)
         {
+            var extension = FirstString(values, "ext") ?? "mp4";
+            var videoCodec = FirstString(values, "vcodec");
             return new MediaAssetInfo
             {
                 Index = index,
-                Type = "视频",
-                Extension = FirstString(values, "ext") ?? "mp4",
+                Type = IsVideoExtension(extension) || (!string.IsNullOrWhiteSpace(videoCodec) && !string.Equals(videoCodec, "none", StringComparison.OrdinalIgnoreCase)) ? "视频" : "图片",
+                Extension = extension,
                 Url = FirstString(values, "webpage_url", "original_url"),
                 Width = GetInt(values, "width"),
-                Height = GetInt(values, "height")
+                Height = GetInt(values, "height"),
+                FileSize = GetLong(values, "filesize", "filesize_approx"),
+                DurationSeconds = GetDouble(values, "duration"),
+                ThumbnailUrl = FirstString(values, "thumbnail")
             };
         }
 
@@ -461,7 +533,7 @@ namespace LiveBoard
                     }
                     using (var client = new HttpClient(handler))
                     {
-                        client.Timeout = TimeSpan.FromSeconds(30);
+                        client.Timeout = TimeSpan.FromSeconds(60);
                         client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36");
                         client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
                         using (var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
@@ -490,20 +562,21 @@ namespace LiveBoard
                                 Engine = "direct",
                                 Title = title.Replace("\r", " ").Replace("\n", " ").Trim()
                             };
+                            var thumbnail = ExtractOpenGraphValue(html, "og:image");
                             for (var index = 0; index < mediaUrls.Count; index++)
                             {
                                 var extension = ExtensionFromUrl(mediaUrls[index]);
-                                if (string.Equals(extension, "m3u8", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, "mpd", StringComparison.OrdinalIgnoreCase))
-                                    extension = "mp4";
                                 result.Assets.Add(new MediaAssetInfo
                                 {
                                     Index = index + 1,
                                     Type = "视频",
                                     Extension = string.IsNullOrWhiteSpace(extension) ? "媒体流" : extension.ToLowerInvariant(),
-                                    Url = mediaUrls[index]
+                                    Url = mediaUrls[index],
+                                    ThumbnailUrl = thumbnail
                                 });
                             }
                             result.AssetCount = result.Assets.Count;
+                            await EnrichDirectAssetsAsync(result.Assets, url, proxy, client, cancellationToken, progress);
                             return result;
                         }
                     }
@@ -577,6 +650,245 @@ namespace LiveBoard
             return urls.Take(MaxPageMediaAssets).ToList();
         }
 
+        private async Task EnrichDirectAssetsAsync(IList<MediaAssetInfo> assets, string pageUrl, string proxy, HttpClient client, CancellationToken cancellationToken, Action<string> progress)
+        {
+            for (var offset = 0; offset < assets.Count; offset += 2)
+            {
+                var batch = assets.Skip(offset).Take(2).Select(async asset =>
+                {
+                    ReportProgress(progress, "正在读取第 " + asset.Index + "/" + assets.Count + " 个媒体信息");
+                    try
+                    {
+                        if (string.Equals(ExtensionFromUrl(asset.Url), "m3u8", StringComparison.OrdinalIgnoreCase))
+                            await ProbeHlsAssetAsync(asset, client, pageUrl, cancellationToken);
+                        else
+                            asset.FileSize = await GetRemoteContentLengthAsync(client, asset.Url, pageUrl, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                            throw;
+                    }
+                    catch
+                    {
+                    }
+
+                    await ProbeVideoAssetAsync(asset, pageUrl, proxy, cancellationToken);
+                }).ToArray();
+                await Task.WhenAll(batch);
+            }
+        }
+
+        private static async Task ProbeHlsAssetAsync(MediaAssetInfo asset, HttpClient client, string pageUrl, CancellationToken cancellationToken)
+        {
+            using (var request = new HttpRequestMessage(HttpMethod.Get, asset.Url))
+            {
+                Uri referer;
+                if (Uri.TryCreate(pageUrl, UriKind.Absolute, out referer))
+                    request.Headers.Referrer = referer;
+                using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken))
+                {
+                    response.EnsureSuccessStatusCode();
+                    var playlist = await response.Content.ReadAsStringAsync();
+                    var lines = Regex.Split(playlist ?? string.Empty, @"\r?\n");
+                    var segmentUrls = new List<string>();
+                    var segmentDurations = new List<double>();
+                    double pendingDuration = 0;
+                    long byteRangeTotal = 0;
+                    foreach (var rawLine in lines)
+                    {
+                        var line = (rawLine ?? string.Empty).Trim();
+                        if (line.StartsWith("#EXTINF:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var value = line.Substring(8).Split(',')[0];
+                            double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out pendingDuration);
+                        }
+                        else if (line.StartsWith("#EXT-X-BYTERANGE:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            long length;
+                            if (long.TryParse(line.Substring(17).Split('@')[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out length))
+                                byteRangeTotal += length;
+                        }
+                        else if (line.Length > 0 && line[0] != '#' && pendingDuration > 0)
+                        {
+                            Uri segmentUri;
+                            if (Uri.TryCreate(new Uri(asset.Url), line, out segmentUri))
+                            {
+                                segmentUrls.Add(segmentUri.AbsoluteUri);
+                                segmentDurations.Add(pendingDuration);
+                            }
+                            pendingDuration = 0;
+                        }
+                    }
+
+                    var duration = segmentDurations.Sum();
+                    if (duration > 0)
+                        asset.DurationSeconds = duration;
+                    if (byteRangeTotal > 0)
+                    {
+                        asset.FileSize = byteRangeTotal;
+                        return;
+                    }
+                    if (segmentUrls.Count == 0)
+                        return;
+
+                    var sampleCount = Math.Min(8, segmentUrls.Count);
+                    var sampleIndexes = Enumerable.Range(0, sampleCount)
+                        .Select(index => sampleCount == 1 ? 0 : index * (segmentUrls.Count - 1) / (sampleCount - 1))
+                        .Distinct()
+                        .ToList();
+                    var sizes = await Task.WhenAll(sampleIndexes
+                        .Select(index => GetRemoteContentLengthAsync(client, segmentUrls[index], pageUrl, cancellationToken))
+                        .ToArray());
+                    long measuredBytes = 0;
+                    double measuredDuration = 0;
+                    for (var index = 0; index < sizes.Length; index++)
+                    {
+                        if (sizes[index] <= 0)
+                            continue;
+                        measuredBytes += sizes[index];
+                        measuredDuration += segmentDurations[sampleIndexes[index]];
+                    }
+                    if (measuredBytes > 0 && measuredDuration > 0 && duration > 0)
+                    {
+                        asset.FileSize = (long)Math.Round(measuredBytes * duration / measuredDuration);
+                        asset.FileSizeIsEstimated = sampleIndexes.Count < segmentUrls.Count;
+                    }
+                }
+            }
+        }
+
+        private static async Task<long> GetRemoteContentLengthAsync(HttpClient client, string url, string pageUrl, CancellationToken cancellationToken)
+        {
+            foreach (var useRange in new[] { false, true })
+            {
+                using (var request = new HttpRequestMessage(useRange ? HttpMethod.Get : HttpMethod.Head, url))
+                {
+                    Uri referer;
+                    if (Uri.TryCreate(pageUrl, UriKind.Absolute, out referer))
+                        request.Headers.Referrer = referer;
+                    if (useRange)
+                        request.Headers.TryAddWithoutValidation("Range", "bytes=0-0");
+                    try
+                    {
+                        using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                        {
+                            if (!response.IsSuccessStatusCode)
+                                continue;
+                            if (response.Content.Headers.ContentRange != null && response.Content.Headers.ContentRange.HasLength)
+                                return response.Content.Headers.ContentRange.Length.Value;
+                            var length = response.Content.Headers.ContentLength.GetValueOrDefault();
+                            if (length > 0 && (!useRange || response.StatusCode == HttpStatusCode.OK))
+                                return length;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                            throw;
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            return 0;
+        }
+
+        private async Task ProbeVideoAssetAsync(MediaAssetInfo asset, string pageUrl, string proxy, CancellationToken cancellationToken)
+        {
+            var previewPath = GetMediaPreviewPath(asset.Url);
+            Directory.CreateDirectory(Path.GetDirectoryName(previewPath));
+            var createPreview = !File.Exists(previewPath) || new FileInfo(previewPath).Length == 0;
+            var arguments = new List<string> { "-hide_banner", "-y", "-loglevel", "info" };
+            if (!string.IsNullOrWhiteSpace(proxy))
+            {
+                arguments.Add("-http_proxy");
+                arguments.Add(proxy.Trim());
+            }
+            arguments.Add("-referer");
+            arguments.Add(pageUrl);
+            arguments.Add("-user_agent");
+            arguments.Add("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36");
+            arguments.Add("-ss");
+            arguments.Add("1");
+            arguments.Add("-i");
+            arguments.Add(asset.Url);
+            arguments.Add("-frames:v");
+            arguments.Add("1");
+            arguments.Add("-an");
+            if (createPreview)
+            {
+                arguments.Add("-vf");
+                arguments.Add("scale=320:-2");
+                arguments.Add("-q:v");
+                arguments.Add("4");
+                arguments.Add(previewPath);
+            }
+            else
+            {
+                arguments.Add("-f");
+                arguments.Add("null");
+                arguments.Add("NUL");
+            }
+
+            try
+            {
+                var run = await RunToolAsync(RecordingService.EnsureBundledFfmpeg(), arguments, cancellationToken, null);
+                if (run.Cancelled)
+                    throw new OperationCanceledException(cancellationToken);
+                var log = run.StandardError ?? string.Empty;
+                var duration = Regex.Match(log, @"Duration:\s*(?<hours>\d{1,3}):(?<minutes>\d{2}):(?<seconds>\d{2}(?:\.\d+)?)", RegexOptions.IgnoreCase);
+                if (asset.DurationSeconds <= 0 && duration.Success)
+                {
+                    asset.DurationSeconds = double.Parse(duration.Groups["hours"].Value, CultureInfo.InvariantCulture) * 3600 +
+                                            double.Parse(duration.Groups["minutes"].Value, CultureInfo.InvariantCulture) * 60 +
+                                            double.Parse(duration.Groups["seconds"].Value, CultureInfo.InvariantCulture);
+                }
+                var dimensions = Regex.Match(log, @"Video:[^\r\n]*?(?<width>\d{2,5})x(?<height>\d{2,5})(?:[,\s])", RegexOptions.IgnoreCase);
+                if (dimensions.Success)
+                {
+                    asset.Width = GetInt(dimensions.Groups["width"].Value);
+                    asset.Height = GetInt(dimensions.Groups["height"].Value);
+                }
+                var codec = Regex.Match(log, @"Video:\s*(?<codec>[^,\s(]+)", RegexOptions.IgnoreCase);
+                if (codec.Success)
+                    asset.Codec = FormatCodec(codec.Groups["codec"].Value);
+                if (File.Exists(previewPath) && new FileInfo(previewPath).Length > 0)
+                    asset.ThumbnailUrl = previewPath;
+                else
+                    DeleteQuietly(previewPath);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                DeleteQuietly(previewPath);
+            }
+        }
+
+        private static string GetMediaPreviewPath(string url)
+        {
+            Uri uri;
+            var key = Uri.TryCreate(url, UriKind.Absolute, out uri) ? uri.GetLeftPart(UriPartial.Path) : url;
+            using (var sha = SHA256.Create())
+            {
+                var hash = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(key ?? string.Empty))).Replace("-", string.Empty);
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LiveBoard", "media-previews", hash.Substring(0, 24) + ".jpg");
+            }
+        }
+
+        private static string FormatCodec(string codec)
+        {
+            if (string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase) || string.Equals(codec, "avc1", StringComparison.OrdinalIgnoreCase)) return "H.264";
+            if (string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase) || string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase)) return "H.265";
+            if (string.Equals(codec, "av1", StringComparison.OrdinalIgnoreCase)) return "AV1";
+            if (string.Equals(codec, "vp9", StringComparison.OrdinalIgnoreCase)) return "VP9";
+            return string.IsNullOrWhiteSpace(codec) ? null : codec.ToUpperInvariant();
+        }
+
         private static string DecodeGenericMediaUrl(string value)
         {
             if (string.IsNullOrWhiteSpace(value))
@@ -641,7 +953,14 @@ namespace LiveBoard
                                 AssetCount = 1,
                                 Assets =
                                 {
-                                    new MediaAssetInfo { Index = 1, Type = "视频", Extension = extension, Url = mediaUrl }
+                                    new MediaAssetInfo
+                                    {
+                                        Index = 1,
+                                        Type = "视频",
+                                        Extension = extension,
+                                        Url = mediaUrl,
+                                        ThumbnailUrl = ExtractOpenGraphValue(html, "og:image")
+                                    }
                                 }
                             };
                         }
@@ -703,8 +1022,10 @@ namespace LiveBoard
                         var meta = values[2] as Dictionary<string, object>;
                         var ext = FirstString(meta, "extension") ?? ExtensionFromUrl(values[1] as string);
                         var type = FirstString(meta, "type");
-                        if (string.IsNullOrWhiteSpace(type))
-                            type = IsVideoExtension(ext) ? "视频" : "图片";
+                        if (IsVideoExtension(ext) || string.Equals(type, "video", StringComparison.OrdinalIgnoreCase))
+                            type = "视频";
+                        else
+                            type = "图片";
                         result.Assets.Add(new MediaAssetInfo
                         {
                             Index = index++,
@@ -712,7 +1033,12 @@ namespace LiveBoard
                             Extension = ext,
                             Url = values[1] as string,
                             Width = GetInt(meta, "width"),
-                            Height = GetInt(meta, "height")
+                            Height = GetInt(meta, "height"),
+                            FileSize = GetLong(meta, "filesize", "file_size", "size"),
+                            DurationSeconds = GetDouble(meta, "duration"),
+                            ThumbnailUrl = IsVideoExtension(ext)
+                                ? FirstString(meta, "thumbnail", "preview", "image")
+                                : values[1] as string
                         });
                     }
                 }
@@ -1069,20 +1395,21 @@ namespace LiveBoard
             return Regex.IsMatch(error ?? string.Empty, @"(?m)^ERROR:");
         }
 
-        private static string GetDownloadUrl(MediaAnalysisResult analysis)
+        private static string GetDownloadUrl(MediaAnalysisResult analysis, IList<MediaAssetInfo> selectedAssets)
         {
-            if (analysis != null && string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase) && analysis.Assets.Count > 0 && !string.IsNullOrWhiteSpace(analysis.Assets[0].Url))
-                return analysis.Assets[0].Url;
+            var first = selectedAssets == null ? null : selectedAssets.FirstOrDefault(asset => asset != null && !string.IsNullOrWhiteSpace(asset.Url));
+            if (analysis != null && string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase) && first != null)
+                return first.Url;
             return analysis == null ? null : analysis.Url;
         }
 
-        private static IEnumerable<string> GetDownloadUrls(MediaAnalysisResult analysis)
+        private static IEnumerable<string> GetDownloadUrls(MediaAnalysisResult analysis, IList<MediaAssetInfo> selectedAssets)
         {
             if (analysis == null)
                 return Enumerable.Empty<string>();
             if (string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase))
             {
-                return analysis.Assets
+                return (selectedAssets ?? new List<MediaAssetInfo>())
                     .Where(asset => asset != null && !string.IsNullOrWhiteSpace(asset.Url))
                     .Select(asset => asset.Url)
                     .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1090,6 +1417,17 @@ namespace LiveBoard
                     .ToList();
             }
             return string.IsNullOrWhiteSpace(analysis.Url) ? Enumerable.Empty<string>() : new[] { analysis.Url };
+        }
+
+        private static string BuildItemSelection(IEnumerable<MediaAssetInfo> assets)
+        {
+            return string.Join(",", assets
+                .Where(asset => asset != null && asset.Index > 0)
+                .Select(asset => asset.Index)
+                .Distinct()
+                .OrderBy(index => index)
+                .Select(index => index.ToString(CultureInfo.InvariantCulture))
+                .ToArray());
         }
 
         private static string ExtractKuaishouMediaUrl(string html)
@@ -1202,6 +1540,19 @@ namespace LiveBoard
             if (value == null) return 0;
             try { return Convert.ToInt32(value); }
             catch { int result; return int.TryParse(Convert.ToString(value), out result) ? result : 0; }
+        }
+
+        private static long GetLong(Dictionary<string, object> dictionary, params string[] keys)
+        {
+            foreach (var key in keys)
+            {
+                var value = GetValue(dictionary, key);
+                if (value == null)
+                    continue;
+                try { return Convert.ToInt64(value); }
+                catch { long result; if (long.TryParse(Convert.ToString(value), out result)) return result; }
+            }
+            return 0;
         }
 
         private static double GetDouble(Dictionary<string, object> dictionary, string key)

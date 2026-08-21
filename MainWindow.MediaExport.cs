@@ -92,6 +92,7 @@ namespace LiveBoard
             MediaQualityCombo.ItemsSource = null;
             MediaQualityPanel.Visibility = Visibility.Collapsed;
             MediaCountBadge.Visibility = Visibility.Collapsed;
+            MediaSelectAllCheckBox.Visibility = Visibility.Collapsed;
             MediaProgressBar.Visibility = Visibility.Collapsed;
             MediaProgressBar.IsIndeterminate = false;
             MediaProgressBar.Value = 0;
@@ -132,6 +133,8 @@ namespace LiveBoard
                 MediaCountBadge.Visibility = Visibility.Visible;
                 MediaAssetItems.ItemsSource = result.Assets;
                 MediaAssetItems.Visibility = Visibility.Visible;
+                MediaSelectAllCheckBox.Visibility = result.AssetCount > 1 ? Visibility.Visible : Visibility.Collapsed;
+                UpdateMediaSelectionUi();
                 MediaTaskPlatformText.Text = result.Platform;
                 MediaTaskTitleText.Text = MediaTitleText.Text;
                 MediaTaskTitleText.ToolTip = result.Title;
@@ -144,8 +147,7 @@ namespace LiveBoard
                     MediaFormatHintText.Text = result.Platform == "Bilibili" ? "B站账号权限决定可选画质" : "按原始媒体流导出";
                 }
                 else
-                    MediaFormatHintText.Text = "全部媒体按原始文件导出";
-                StartMediaButton.IsEnabled = true;
+                    MediaFormatHintText.Text = "所选媒体按原始文件导出";
                 SetMediaStatus("媒体已就绪", result.Platform + " · " + result.AssetCount + " 个可导出媒体", "已就绪", "✓", FindBrush("MintBrush"));
             }
             catch (OperationCanceledException)
@@ -169,6 +171,12 @@ namespace LiveBoard
         {
             if (_mediaCancellation != null || _mediaAnalysis == null || !_mediaAnalysis.Success)
                 return;
+            var selectedAssets = _mediaAnalysis.Assets.Where(asset => asset.IsSelected).ToList();
+            if (selectedAssets.Count == 0)
+            {
+                SetMediaStatus("请选择要导出的媒体", "勾选至少一个媒体后再开始导出", "需要选择", "!", FindBrush("OrangeBrush"));
+                return;
+            }
             var directory = GetMediaOutputDirectory();
             try
             {
@@ -185,18 +193,20 @@ namespace LiveBoard
             _mediaCancellation = cancellation;
             _mediaFailureLog = null;
             _mediaProgressFloor = 0;
-            _mediaProgressTotalAssets = Math.Max(1, _mediaAnalysis.AssetCount);
+            _mediaProgressTotalAssets = selectedAssets.Count;
             _mediaCompletedAssets = 0;
             _mediaCurrentPercent = 0;
             _mediaPostProcessing = false;
             _mediaLastSpeed = null;
             _mediaLastEta = null;
             SetMediaBusy(true, "导出中");
-                SetMediaStatus("正在导出媒体", _mediaAnalysis.Title, "导出中", "…", FindBrush("BrightGreenBrush"));
+            SetMediaStatus("正在导出媒体", _mediaAnalysis.Title, "导出中", "…", FindBrush("BrightGreenBrush"));
+            SetMediaProgress(0, null, null);
             try
             {
                 var result = await _mediaExporter.ExportAsync(
                     _mediaAnalysis,
+                    selectedAssets,
                     format,
                     directory,
                     GetMediaCookieBrowser(),
@@ -217,7 +227,7 @@ namespace LiveBoard
                 }
                 if (result.PartialSuccess)
                 {
-                    var total = Math.Max(result.DownloadedCount, _mediaAnalysis.AssetCount);
+                    var total = Math.Max(result.DownloadedCount, selectedAssets.Count);
                     MediaProgressBar.IsIndeterminate = false;
                     MediaProgressBar.Value = 100d * result.DownloadedCount / total;
                     SetMediaPartialStatus(result.DownloadedCount, total, result.ErrorText, result.LogText);
@@ -245,7 +255,7 @@ namespace LiveBoard
                 SetMediaBusy(false, null);
                 if (_mediaAnalysis == null || !_mediaAnalysis.Success)
                     MediaProgressBar.Visibility = Visibility.Collapsed;
-                StartMediaButton.IsEnabled = _mediaAnalysis != null && _mediaAnalysis.Success;
+                UpdateMediaSelectionUi();
             }
         }
 
@@ -352,6 +362,39 @@ namespace LiveBoard
                 MediaFormatHintText.Text = quality.Label;
         }
 
+        private void MediaAssetSelection_OnClick(object sender, RoutedEventArgs e)
+        {
+            var checkBox = sender as CheckBox;
+            var asset = checkBox == null ? null : checkBox.DataContext as MediaAssetInfo;
+            if (asset == null)
+                return;
+            asset.IsSelected = checkBox.IsChecked == true;
+            UpdateMediaSelectionUi();
+        }
+
+        private void MediaSelectAll_OnClick(object sender, RoutedEventArgs e)
+        {
+            if (_mediaAnalysis == null)
+                return;
+            var selected = MediaSelectAllCheckBox.IsChecked == true;
+            foreach (var asset in _mediaAnalysis.Assets)
+                asset.IsSelected = selected;
+            MediaAssetItems.Items.Refresh();
+            UpdateMediaSelectionUi();
+        }
+
+        private void UpdateMediaSelectionUi()
+        {
+            var assets = _mediaAnalysis == null ? null : _mediaAnalysis.Assets;
+            var total = assets == null ? 0 : assets.Count;
+            var selected = assets == null ? 0 : assets.Count(asset => asset.IsSelected);
+            if (total > 0)
+                MediaCountText.Text = "已选 " + selected + " / " + total;
+            if (MediaSelectAllCheckBox != null)
+                MediaSelectAllCheckBox.IsChecked = total > 0 && selected == total;
+            StartMediaButton.IsEnabled = _mediaCancellation == null && selected > 0;
+        }
+
         private void SetMediaOutputDirectory(string directory)
         {
             if (string.IsNullOrWhiteSpace(directory))
@@ -430,8 +473,7 @@ namespace LiveBoard
                             _mediaPostProcessing = false;
                             MediaProgressBar.IsIndeterminate = true;
                             MediaProgressBar.Visibility = Visibility.Visible;
-                            MediaProgressText.Text = "处理中";
-                            MediaTaskStateText.Text = "处理中";
+                            SetMediaWorkingProgressText();
                             MediaStatusDetailText.Text = "正在接收媒体数据";
                         }
                     }
@@ -455,8 +497,7 @@ namespace LiveBoard
                             _mediaPostProcessing = false;
                             MediaProgressBar.IsIndeterminate = true;
                             MediaProgressBar.Visibility = Visibility.Visible;
-                            MediaProgressText.Text = "处理中";
-                            MediaTaskStateText.Text = "处理中";
+                            SetMediaWorkingProgressText();
                         }
                     }
                 }));
@@ -475,7 +516,8 @@ namespace LiveBoard
             MediaProgressBar.IsIndeterminate = false;
             MediaProgressBar.Visibility = Visibility.Visible;
             MediaProgressBar.Value = _mediaProgressFloor;
-            MediaProgressText.Text = _mediaProgressFloor.ToString("0.#", CultureInfo.InvariantCulture) + "%";
+            var percentText = _mediaProgressFloor.ToString("0.#", CultureInfo.InvariantCulture) + "%";
+            MediaProgressText.Text = totalAssets > 1 ? CurrentMediaNumber() + "/" + totalAssets + " · " + percentText : percentText;
             MediaTaskStateText.Text = MediaProgressText.Text;
             var speedText = NormalizeMediaSpeed(speed);
             var etaText = NormalizeMediaEta(eta);
@@ -503,6 +545,18 @@ namespace LiveBoard
                 .Where(part => !string.IsNullOrWhiteSpace(part))
                 .ToArray();
             MediaStatusDetailText.Text = detail.Length > 0 ? string.Join(" · ", detail) : "正在接收媒体数据";
+        }
+
+        private void SetMediaWorkingProgressText()
+        {
+            var total = Math.Max(1, _mediaProgressTotalAssets);
+            MediaProgressText.Text = total > 1 ? CurrentMediaNumber() + "/" + total : "处理中";
+            MediaTaskStateText.Text = MediaProgressText.Text;
+        }
+
+        private int CurrentMediaNumber()
+        {
+            return Math.Min(Math.Max(1, _mediaProgressTotalAssets), _mediaCompletedAssets + 1);
         }
 
         private static bool IsMediaPostProcessingLine(string line)
@@ -593,7 +647,9 @@ namespace LiveBoard
         private void SetMediaBusy(bool busy, string state)
         {
             AnalyzeMediaButton.IsEnabled = !busy;
-            StartMediaButton.IsEnabled = !busy && _mediaAnalysis != null && _mediaAnalysis.Success;
+            MediaAssetItems.IsEnabled = !busy;
+            MediaSelectAllCheckBox.IsEnabled = !busy;
+            StartMediaButton.IsEnabled = !busy && _mediaAnalysis != null && _mediaAnalysis.Success && _mediaAnalysis.Assets.Any(asset => asset.IsSelected);
             CancelMediaButton.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
             if (busy && state == "导出中")
             {
