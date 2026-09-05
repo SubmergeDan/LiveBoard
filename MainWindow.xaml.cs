@@ -5,10 +5,12 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -144,18 +146,18 @@ namespace LiveBoard
         private async void AddRoom_OnClick(object sender, RoutedEventArgs e)
         {
             var platform = NormalizePlatform(PlatformCombo.SelectedItem as string);
-            var roomId = NormalizeRoomId(_roomInputPlaceholder ? string.Empty : RoomInput.Text, platform);
+            var roomId = await NormalizeRoomIdAsync(_roomInputPlaceholder ? string.Empty : RoomInput.Text, platform);
             if (string.IsNullOrWhiteSpace(roomId))
             {
                 var hint = platform == "Bilibili"
                     ? "请输入 Bilibili 房间号，或粘贴 live.bilibili.com 直播链接。"
-                    : "请输入 6-20 位抖音房间号，或粘贴 live.douyin.com、www.douyin.com/follow/live 直播链接。";
+                    : "请输入 6-20 位抖音房间号，或粘贴抖音直播链接及分享文案。";
                 MessageBox.Show(hint, "无法添加", MessageBoxButton.OK, MessageBoxImage.Information);
                 RoomInput.Focus();
                 return;
             }
 
-            var quality = platform == "Bilibili" ? "自动" : (AddQualityCombo.SelectedItem as string ?? "自动");
+            var quality = "自动";
             var format = AddFormatCombo.SelectedItem as string ?? "MP4";
             var existing = Rooms.FirstOrDefault(candidate => candidate.RoomId == roomId && NormalizePlatform(candidate.Platform) == platform);
             if (existing != null)
@@ -206,7 +208,7 @@ namespace LiveBoard
             UpdateAddQualityEditorVisibility();
             UpdateBilibiliAccountUi();
             if (RoomInput != null)
-                RoomInput.ToolTip = platform == "Bilibili" ? "输入 Bilibili 房间号或 live.bilibili.com 链接" : "输入抖音房间号或 live.douyin.com 链接";
+                RoomInput.ToolTip = platform == "Bilibili" ? "输入 Bilibili 房间号或 live.bilibili.com 链接" : "输入抖音房间号、直播链接或分享文案";
             if (_loadingControls || _config == null)
                 return;
             _config.DefaultPlatform = platform;
@@ -398,9 +400,15 @@ namespace LiveBoard
             SelectedRoomTitle.Text = room.DisplayName;
             SelectedRoomId.Text = room.RoomId + " · " + (string.IsNullOrWhiteSpace(room.OutputFormat) ? "MP4" : room.OutputFormat) + " 输出";
             RoomQualityCombo.Items.Clear();
-            foreach (var quality in GetQualityOptions(room.Platform))
+            var qualityOptions = room.AvailableQualities.Count == 0
+                ? new[] { "自动" }
+                : room.AvailableQualities.ToArray();
+            foreach (var quality in qualityOptions)
                 RoomQualityCombo.Items.Add(quality);
-            RoomQualityCombo.SelectedItem = string.IsNullOrWhiteSpace(room.Quality) ? "自动" : room.Quality;
+            var selectedQuality = string.IsNullOrWhiteSpace(room.Quality) ? "自动" : room.Quality;
+            RoomQualityCombo.SelectedItem = qualityOptions.Contains(selectedQuality) ? selectedQuality : "自动";
+            if (!qualityOptions.Contains(selectedQuality))
+                room.Quality = "自动";
             RoomFormatCombo.SelectedItem = string.IsNullOrWhiteSpace(room.OutputFormat) ? "MP4" : room.OutputFormat;
             SegmentModeCombo.SelectedItem = string.IsNullOrWhiteSpace(room.SegmentMode) ? (room.SegmentEnabled ? "时间" : "关闭") : room.SegmentMode;
             SegmentMinutesSlider.Value = Math.Max(1, Math.Min(180, room.SegmentMinutes <= 0 ? 60 : room.SegmentMinutes));
@@ -484,7 +492,7 @@ namespace LiveBoard
         {
             var combo = sender as ComboBox;
             var room = combo == null ? null : combo.Tag as RoomConfig;
-            if (room == null || _config == null || combo.SelectedItem == null)
+            if (_loadingControls || room == null || _config == null || combo.SelectedItem == null)
                 return;
             var quality = combo.SelectedItem as string;
             if (string.Equals(room.Quality, quality, StringComparison.OrdinalIgnoreCase))
@@ -1512,8 +1520,21 @@ namespace LiveBoard
                 var qualitySelectionChanged = false;
                 var shouldAutoStart = false;
                 var shouldAutoStop = false;
-                if (NormalizePlatform(room.Platform) == "Bilibili" && result.AvailableQualities != null && result.AvailableQualities.Length > 0)
-                    qualitySelectionChanged = ApplyBilibiliQualityOptions(room, result.AvailableQualities);
+                if (result.IsLive && !result.HasError && result.AvailableQualities != null && result.AvailableQualities.Length > 0)
+                {
+                    var wasLoadingControls = _loadingControls;
+                    _loadingControls = true;
+                    try
+                    {
+                        qualitySelectionChanged = NormalizePlatform(room.Platform) == "Bilibili"
+                            ? ApplyBilibiliQualityOptions(room, result.AvailableQualities)
+                            : ApplyDouyinQualityOptions(room, result.AvailableQualities);
+                    }
+                    finally
+                    {
+                        _loadingControls = wasLoadingControls;
+                    }
+                }
                 if (NeedsAutomaticRoomName(room.Remark) && !string.IsNullOrWhiteSpace(result.DisplayName))
                 {
                     room.Remark = result.DisplayName.Trim();
@@ -1529,7 +1550,7 @@ namespace LiveBoard
                 else if (result.IsLive)
                 {
                     room.LiveStatus = "开播";
-                    room.LiveStatusDetail = "已发现直播流";
+                    room.LiveStatusDetail = ShortenStatus(result.Message ?? "已发现直播流");
                     room.ConsecutiveOfflineChecks = 0;
                     shouldAutoStart = room.AutoRecordEnabled && !room.AutoRecordSuppressed && !room.IsRecording && !_recordingStarting.Contains(room);
                 }
@@ -1773,9 +1794,7 @@ namespace LiveBoard
 
         private string[] GetQualityOptions(string platform)
         {
-            if (NormalizePlatform(platform) == "Bilibili")
-                return new[] { "自动" };
-            return new[] { "自动", "原画", "蓝光", "超清", "高清", "标清", "流畅" };
+            return new[] { "自动" };
         }
 
         private void RefreshAddQualityOptions(string preferred)
@@ -1798,20 +1817,44 @@ namespace LiveBoard
                 var selectedQuality = string.IsNullOrWhiteSpace(room.Quality) ? "自动" : room.Quality;
                 if (normalizeSelection)
                 {
-                    selectedQuality = "自动";
+                    room.AvailableQualities.Clear();
                     room.Quality = "自动";
+                    room.AvailableQualities.Add("自动");
+                    return;
                 }
-                room.AvailableQualities.Clear();
-                room.AvailableQualities.Add("自动");
-                if (selectedQuality != "自动")
-                    room.AvailableQualities.Add(selectedQuality);
+                var bilibiliOptions = room.AvailableQualities
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Select(value => value.Trim())
+                    .Distinct()
+                    .ToList();
+                if (bilibiliOptions.Count == 0 && selectedQuality != "自动")
+                    bilibiliOptions.Add(selectedQuality);
+                bilibiliOptions.Remove("自动");
+                bilibiliOptions.Insert(0, "自动");
+                if (!room.AvailableQualities.SequenceEqual(bilibiliOptions))
+                {
+                    room.AvailableQualities.Clear();
+                    foreach (var option in bilibiliOptions)
+                        room.AvailableQualities.Add(option);
+                }
+                if (!bilibiliOptions.Contains(selectedQuality))
+                    room.Quality = "自动";
                 return;
             }
-            var options = GetQualityOptions(room.Platform);
-            room.AvailableQualities.Clear();
-            foreach (var quality in options)
-                room.AvailableQualities.Add(quality);
-            if (normalizeSelection && !options.Contains(string.IsNullOrWhiteSpace(room.Quality) ? "自动" : room.Quality))
+            var options = room.AvailableQualities
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Select(value => value.Trim())
+                .Distinct()
+                .ToList();
+            options.Remove("自动");
+            options.Insert(0, "自动");
+            if (normalizeSelection || !room.AvailableQualities.SequenceEqual(options))
+            {
+                room.AvailableQualities.Clear();
+                foreach (var option in options)
+                    room.AvailableQualities.Add(option);
+            }
+            if (normalizeSelection || !options.Contains(room.Quality ?? "自动"))
                 room.Quality = "自动";
         }
 
@@ -1825,7 +1868,8 @@ namespace LiveBoard
             options.Remove("自动");
             options.Insert(0, "自动");
 
-            if (!room.AvailableQualities.SequenceEqual(options))
+            var changed = !room.AvailableQualities.SequenceEqual(options);
+            if (changed)
             {
                 room.AvailableQualities.Clear();
                 foreach (var option in options)
@@ -1834,7 +1878,32 @@ namespace LiveBoard
 
             var selectedQuality = string.IsNullOrWhiteSpace(room.Quality) ? "自动" : room.Quality;
             if (options.Contains(selectedQuality))
-                return false;
+                return changed;
+            room.Quality = "自动";
+            return true;
+        }
+
+        private bool ApplyDouyinQualityOptions(RoomConfig room, IEnumerable<string> availableQualities)
+        {
+            var options = availableQualities
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Select(value => value.Trim())
+                .Distinct()
+                .ToList();
+            options.Remove("自动");
+            options.Insert(0, "自动");
+
+            var changed = !room.AvailableQualities.SequenceEqual(options);
+            if (changed)
+            {
+                room.AvailableQualities.Clear();
+                foreach (var option in options)
+                    room.AvailableQualities.Add(option);
+            }
+
+            var selectedQuality = string.IsNullOrWhiteSpace(room.Quality) ? "自动" : room.Quality;
+            if (options.Contains(selectedQuality))
+                return changed;
             room.Quality = "自动";
             return true;
         }
@@ -1852,9 +1921,8 @@ namespace LiveBoard
         {
             if (PlatformCombo == null || AddQualityCombo == null || AddQualityColumn == null)
                 return;
-            var visible = NormalizePlatform(PlatformCombo.SelectedItem as string) == "抖音";
-            AddQualityCombo.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
-            AddQualityColumn.Width = visible ? new GridLength(110) : new GridLength(0);
+            AddQualityCombo.Visibility = Visibility.Collapsed;
+            AddQualityColumn.Width = new GridLength(0);
         }
 
         private void UpdateBilibiliAccountUi()
@@ -1900,6 +1968,87 @@ namespace LiveBoard
                 return input;
             var match = Regex.Match(input, "(?:live\\.douyin\\.com/|www\\.douyin\\.com/follow/live/)(\\d{6,20})(?:[/?#]|$)", RegexOptions.IgnoreCase);
             return match.Success ? match.Groups[1].Value : null;
+        }
+
+        private async Task<string> NormalizeRoomIdAsync(string input, string platform)
+        {
+            var roomId = NormalizeRoomId(input, platform);
+            if (!string.IsNullOrWhiteSpace(roomId) || NormalizePlatform(platform) == "Bilibili")
+                return roomId;
+
+            var sharedUrl = Regex.Match((input ?? string.Empty).Replace("\\_", "_"), @"https?://(?:v\.douyin\.com/[a-zA-Z0-9_-]+/?|webcast\.amemv\.com/douyin/webcast/reflow/\d{6,20}(?:\?[^\s\]\)>]+)?)", RegexOptions.IgnoreCase);
+            if (!sharedUrl.Success)
+                return null;
+            try
+            {
+                using (var handler = new HttpClientHandler { AllowAutoRedirect = false })
+                using (var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) })
+                {
+                    client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36");
+                    var current = new Uri(sharedUrl.Value);
+                    for (var redirect = 0; redirect < 5; redirect++)
+                    {
+                        roomId = await ResolveDouyinReflowWebRidAsync(client, current);
+                        if (!string.IsNullOrWhiteSpace(roomId))
+                            return roomId;
+                        using (var response = await client.GetAsync(current, HttpCompletionOption.ResponseHeadersRead))
+                        {
+                            if (response.Headers.Location == null)
+                                return null;
+                            current = new Uri(current, response.Headers.Location);
+                            if (!(current.Host.Equals("douyin.com", StringComparison.OrdinalIgnoreCase) ||
+                                  current.Host.EndsWith(".douyin.com", StringComparison.OrdinalIgnoreCase) ||
+                                  current.Host.Equals("amemv.com", StringComparison.OrdinalIgnoreCase) ||
+                                  current.Host.EndsWith(".amemv.com", StringComparison.OrdinalIgnoreCase)))
+                                return null;
+                            roomId = NormalizeRoomId(current.AbsoluteUri, platform);
+                            if (!string.IsNullOrWhiteSpace(roomId))
+                                return roomId;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return null;
+        }
+
+        private static async Task<string> ResolveDouyinReflowWebRidAsync(HttpClient client, Uri url)
+        {
+            var room = Regex.Match(url.AbsolutePath, @"^/douyin/webcast/reflow/(?<id>\d{6,20})/?$", RegexOptions.IgnoreCase);
+            var fallbackRoomId = room.Success ? room.Groups["id"].Value : null;
+            var user = Regex.Match(url.Query, @"(?:^|[?&])sec_user_id=(?<id>[^&]+)", RegexOptions.IgnoreCase);
+            if (!room.Success || !user.Success)
+                return fallbackRoomId;
+
+            var api = "https://webcast.amemv.com/webcast/room/reflow/info/?type_id=0&live_id=1&room_id=" + room.Groups["id"].Value +
+                      "&sec_user_id=" + Uri.EscapeDataString(Uri.UnescapeDataString(user.Groups["id"].Value)) + "&app_id=1128";
+            try
+            {
+                using (var response = await client.GetAsync(api, HttpCompletionOption.ResponseContentRead))
+                {
+                    response.EnsureSuccessStatusCode();
+                    var body = await response.Content.ReadAsStringAsync();
+                    if (string.IsNullOrWhiteSpace(body))
+                        return fallbackRoomId;
+                    var root = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 200 }
+                        .DeserializeObject(body) as Dictionary<string, object>;
+                    object dataValue;
+                    object roomValue;
+                    object ownerValue;
+                    object webRidValue;
+                    var data = root != null && root.TryGetValue("data", out dataValue) ? dataValue as Dictionary<string, object> : null;
+                    var roomData = data != null && data.TryGetValue("room", out roomValue) ? roomValue as Dictionary<string, object> : null;
+                    var owner = roomData != null && roomData.TryGetValue("owner", out ownerValue) ? ownerValue as Dictionary<string, object> : null;
+                    var webRid = owner != null && owner.TryGetValue("web_rid", out webRidValue) ? Convert.ToString(webRidValue) : null;
+                    return Regex.IsMatch(webRid ?? string.Empty, @"^\d{6,20}$") ? webRid : fallbackRoomId;
+                }
+            }
+            catch
+            {
+                return fallbackRoomId;
+            }
         }
 
         private Brush FindBrush(string key)

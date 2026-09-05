@@ -163,7 +163,7 @@ namespace LiveBoard
             set { _consecutiveOfflineChecks = value; }
         }
 
-        [IgnoreDataMember]
+        [DataMember(Order = 11)]
         public ObservableCollection<string> AvailableQualities
         {
             get
@@ -172,6 +172,7 @@ namespace LiveBoard
                     _availableQualities = new ObservableCollection<string>();
                 return _availableQualities;
             }
+            set { _availableQualities = value ?? new ObservableCollection<string>(); }
         }
 
         [IgnoreDataMember]
@@ -250,7 +251,8 @@ namespace LiveBoard
                 SegmentMinutes = SegmentMinutes,
                 SegmentSizeMb = SegmentSizeMb,
                 AutoRecordEnabled = AutoRecordEnabled,
-                Platform = Platform
+                Platform = Platform,
+                AvailableQualities = new ObservableCollection<string>(AvailableQualities)
             };
         }
     }

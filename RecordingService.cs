@@ -142,9 +142,13 @@ namespace LiveBoard
 
     internal sealed class RoomPageResult
     {
+        public bool IsLive { get; set; }
+        public bool HasError { get; set; }
+        public string Message { get; set; }
         public string StreamUrl { get; set; }
         public string DisplayName { get; set; }
         public string RoomTitle { get; set; }
+        public string[] AvailableQualities { get; set; }
     }
 
     public sealed class RecordingService
@@ -278,11 +282,13 @@ namespace LiveBoard
                 var page = await FetchRoomPageAsync(room.RoomId, room.Quality, cancellationToken);
                 return new LiveProbeResult
                 {
-                    IsLive = !string.IsNullOrWhiteSpace(page.StreamUrl),
-                    Message = string.IsNullOrWhiteSpace(page.StreamUrl) ? "未开播" : "直播中",
+                    IsLive = page.IsLive,
+                    HasError = page.HasError,
+                    Message = page.Message ?? (page.IsLive ? "直播中" : "未开播"),
                     StreamUrl = page.StreamUrl,
                     DisplayName = page.DisplayName,
-                    RoomTitle = page.RoomTitle
+                    RoomTitle = page.RoomTitle,
+                    AvailableQualities = page.AvailableQualities
                 };
             }
             catch (OperationCanceledException)
@@ -314,6 +320,8 @@ namespace LiveBoard
             {
                 var page = await FetchRoomPageAsync(room.RoomId, room.Quality, cancellationToken);
                 streamUrl = page.StreamUrl;
+                if (string.IsNullOrWhiteSpace(streamUrl) && !string.IsNullOrWhiteSpace(page.Message))
+                    throw new InvalidOperationException(page.Message);
             }
             if (string.IsNullOrWhiteSpace(streamUrl))
                 throw new InvalidOperationException("没有获取到当前平台可用的直播流，可能尚未开播或平台暂时拒绝访问。");
@@ -463,9 +471,16 @@ namespace LiveBoard
                 return result;
 
             var stream = ReadDictionary(room, "stream_url");
+            result.IsLive = true;
+            result.AvailableQualities = BuildDouyinQualityLabels(stream);
             result.StreamUrl = ChooseDouyinStream(stream, quality);
-            if (string.IsNullOrWhiteSpace(result.StreamUrl))
-                throw new InvalidOperationException("直播正在进行，但抖音没有返回可录制的视频流。");
+            var requestedQuality = string.IsNullOrWhiteSpace(quality) ? "自动" : quality.Trim();
+            result.HasError = string.IsNullOrWhiteSpace(result.StreamUrl);
+            result.Message = result.HasError
+                ? (requestedQuality == "自动"
+                    ? "直播中，但抖音没有返回可录制的视频流。"
+                    : "直播中，但没有返回所选画质：" + requestedQuality + "。")
+                : "直播中 · " + GetDouyinStreamQuality(stream, result.StreamUrl);
             return result;
         }
 
@@ -473,19 +488,134 @@ namespace LiveBoard
         {
             if (stream == null)
                 return null;
-            var urls = ReadDictionary(stream, "flv_pull_url");
-            if (urls == null || urls.Count == 0)
-                urls = ReadDictionary(stream, "hls_pull_url_map");
-            if (urls == null || urls.Count == 0)
+            var urls = GetDouyinStreamUrls(stream);
+            if (urls.Count == 0)
                 return null;
-            if (string.IsNullOrWhiteSpace(quality) || quality == "自动")
+            return ChooseQuality(urls, quality);
+        }
+
+        private static Dictionary<string, object> GetDouyinStreamUrls(Dictionary<string, object> stream)
+        {
+            var urls = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            if (stream == null)
+                return urls;
+            AddDouyinUrls(urls, ReadDictionary(stream, "flv_pull_url"));
+            AddDouyinUrls(urls, ReadDictionary(stream, "hls_pull_url_map"));
+
+            var liveCore = ReadDictionary(stream, "live_core_sdk_data");
+            AddDouyinOriginUrl(urls, ReadDictionary(liveCore, "pull_data"));
+
+            var pullDatas = ReadDictionary(stream, "pull_datas");
+            if (pullDatas != null)
             {
-                object preferred;
-                var defaultResolution = ReadString(stream, "default_resolution");
-                if (!string.IsNullOrWhiteSpace(defaultResolution) && urls.TryGetValue(defaultResolution, out preferred))
-                    return preferred as string;
+                foreach (var pair in pullDatas)
+                    AddDouyinOriginUrl(urls, pair.Value as Dictionary<string, object>);
             }
-            return ChooseQuality(urls.Values.OfType<string>().ToList(), quality);
+            return urls;
+        }
+
+        private static void AddDouyinOriginUrl(Dictionary<string, object> target, Dictionary<string, object> pullData)
+        {
+            if (target == null || pullData == null)
+                return;
+            object rawStreamData;
+            if (!pullData.TryGetValue("stream_data", out rawStreamData) || rawStreamData == null)
+                return;
+
+            var streamData = rawStreamData as Dictionary<string, object>;
+            if (streamData == null && rawStreamData is string)
+            {
+                try
+                {
+                    var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 200 };
+                    streamData = serializer.DeserializeObject(rawStreamData as string) as Dictionary<string, object>;
+                }
+                catch
+                {
+                    return;
+                }
+            }
+            var data = ReadDictionary(streamData, "data");
+            var origin = ReadDictionary(data, "origin");
+            var main = ReadDictionary(origin, "main");
+            if (main == null)
+                return;
+
+            var codec = ReadDouyinOriginCodec(main);
+            AddDouyinOriginVariant(target, main, "flv", codec);
+            AddDouyinOriginVariant(target, main, "hls", codec);
+        }
+
+        private static string ReadDouyinOriginCodec(Dictionary<string, object> main)
+        {
+            object rawSdkParams;
+            if (main == null || !main.TryGetValue("sdk_params", out rawSdkParams) || rawSdkParams == null)
+                return null;
+            var parsed = rawSdkParams as Dictionary<string, object>;
+            if (parsed != null)
+                return ReadString(parsed, "VCodec") ?? ReadString(parsed, "vcodec");
+            var sdkParams = rawSdkParams as string;
+            if (string.IsNullOrWhiteSpace(sdkParams))
+                return null;
+            try
+            {
+                var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 50 };
+                parsed = serializer.DeserializeObject(sdkParams) as Dictionary<string, object>;
+                return ReadString(parsed, "VCodec") ?? ReadString(parsed, "vcodec");
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static void AddDouyinOriginVariant(Dictionary<string, object> target, Dictionary<string, object> main, string key, string codec)
+        {
+            var url = ReadString(main, key);
+            if (string.IsNullOrWhiteSpace(url) || target.Any(pair =>
+                GetDouyinQualityLevel(pair.Key, pair.Value as string) == "origin"))
+                return;
+            if (!string.IsNullOrWhiteSpace(codec) && url.IndexOf("codec=", StringComparison.OrdinalIgnoreCase) < 0)
+                url += (url.IndexOf("?", StringComparison.Ordinal) >= 0 ? "&" : "?") + "codec=" + Uri.EscapeDataString(codec);
+            target.Add("ORIGIN", url);
+        }
+
+        private static void AddDouyinUrls(Dictionary<string, object> target, Dictionary<string, object> source)
+        {
+            if (target == null || source == null)
+                return;
+            foreach (var pair in source)
+            {
+                if (pair.Value is string && !string.IsNullOrWhiteSpace(pair.Value as string) && !target.ContainsKey(pair.Key))
+                    target.Add(pair.Key, pair.Value);
+            }
+        }
+
+        private string[] BuildDouyinQualityLabels(Dictionary<string, object> stream)
+        {
+            if (stream == null)
+                return new[] { "自动" };
+            var urls = GetDouyinStreamUrls(stream);
+            var labels = new List<string> { "自动" };
+            foreach (var level in new[] { "origin", "blu_ray", "uhd", "hd", "sd", "ld" })
+            {
+                if (urls.Any(pair => !string.IsNullOrWhiteSpace(pair.Value as string) && GetDouyinQualityLevel(pair.Key, pair.Value as string) == level))
+                    labels.Add(GetDouyinQualityLabel(level));
+            }
+            return labels.ToArray();
+        }
+
+        private string GetDouyinStreamQuality(Dictionary<string, object> stream, string selectedUrl)
+        {
+            if (stream == null || string.IsNullOrWhiteSpace(selectedUrl))
+                return "未知画质";
+            var urls = GetDouyinStreamUrls(stream);
+            foreach (var pair in urls)
+            {
+                if (string.Equals(pair.Value as string, selectedUrl, StringComparison.Ordinal))
+                    return GetDouyinQualityLabel(GetDouyinQualityLevel(pair.Key, selectedUrl));
+            }
+            return "未知画质";
         }
 
         private static Dictionary<string, object> ReadDictionary(Dictionary<string, object> source, string key)
@@ -535,35 +665,132 @@ namespace LiveBoard
             return value;
         }
 
-        private string ChooseQuality(List<string> candidates, string quality)
+        private string ChooseQuality(Dictionary<string, object> candidates, string quality)
         {
             if (candidates == null || candidates.Count == 0)
                 return null;
-            var tokens = new string[0];
-            switch (quality ?? "自动")
+            var requestedQuality = string.IsNullOrWhiteSpace(quality) ? "自动" : quality.Trim();
+            var levels = new List<string>();
+            switch (requestedQuality)
             {
                 case "原画":
-                    tokens = new[] { "uhd", "or4", "origin" };
+                    levels.Add("origin");
                     break;
                 case "蓝光":
+                    levels.Add("blu_ray");
+                    break;
                 case "超清":
-                    tokens = new[] { "uhd", "hd", "or4" };
+                    levels.Add("uhd");
                     break;
                 case "高清":
-                    tokens = new[] { "hd", "sd" };
+                    levels.Add("hd");
                     break;
                 case "标清":
+                    levels.Add("sd");
+                    break;
                 case "流畅":
-                    tokens = new[] { "sd", "ld" };
+                    levels.Add("ld");
                     break;
             }
-            foreach (var token in tokens)
+            if (requestedQuality == "自动")
+                levels.AddRange(new[] { "origin", "blu_ray", "uhd", "hd", "sd", "ld" });
+
+            foreach (var level in levels)
             {
-                var match = candidates.FirstOrDefault(candidate => candidate.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0);
-                if (match != null)
-                    return match;
+                foreach (var candidate in candidates)
+                {
+                    var url = candidate.Value as string;
+                    if (!string.IsNullOrWhiteSpace(url) && GetDouyinQualityLevel(candidate.Key, url) == level)
+                        return url;
+                }
             }
-            return candidates[0];
+
+            return null;
+        }
+
+        private static string GetDouyinQualityLabel(string level)
+        {
+            switch (level)
+            {
+                case "origin": return "原画";
+                case "blu_ray": return "蓝光";
+                case "uhd": return "超清";
+                case "hd": return "高清";
+                case "sd": return "标清";
+                case "ld": return "流畅";
+                default: return "未知画质";
+            }
+        }
+
+        private static string GetDouyinQualityLevel(string key, string streamUrl)
+        {
+            var normalizedKey = (key ?? string.Empty).Trim().ToLowerInvariant().Replace('-', '_');
+            var normalizedUrl = (streamUrl ?? string.Empty).ToLowerInvariant();
+
+            // Douyin reuses FULL_HD1/SD1/SD2 for different templates. The URL
+            // template is authoritative when present (or4, hd, sd, ld).
+            if (Regex.IsMatch(normalizedUrl, @"(?:^|[_/])(?:origin|or4)(?:[._?&/-]|$)"))
+                return "origin";
+            if (Regex.IsMatch(normalizedUrl, @"(?:^|[_/])blue_?ray(?:[._?&/-]|$)"))
+                return "blu_ray";
+            if (Regex.IsMatch(normalizedUrl, @"(?:^|[_-])(?:ls)?uhd5?(?:[._?&/-]|$)"))
+                return "blu_ray";
+            if (Regex.IsMatch(normalizedUrl, @"(?:^|[_-])(?:ls)?hd5?(?:[._?&/-]|$)"))
+                return "uhd";
+            if (Regex.IsMatch(normalizedUrl, @"(?:^|[_-])(?:ls)?sd5?(?:[._?&/-]|$)"))
+                return "hd";
+            if (Regex.IsMatch(normalizedUrl, @"(?:^|[_-])(?:ls)?ld5?(?:[._?&/-]|$)"))
+                return "sd";
+
+            switch (normalizedKey)
+            {
+                case "origin":
+                case "origion":
+                case "or4":
+                    return "origin";
+                case "full_hd1":
+                case "fullhd":
+                case "full_hd":
+                    return "blu_ray";
+                case "blu_ray":
+                case "blue_ray":
+                case "blueray":
+                case "blue-ray":
+                    return "blu_ray";
+                case "uhd":
+                    return "uhd";
+                case "hd1":
+                    return "uhd";
+                case "hd":
+                    return "hd";
+                case "sd1":
+                    return "sd";
+                case "sd":
+                    return "sd";
+                case "sd2":
+                    return "hd";
+                case "ld":
+                    return "ld";
+            }
+
+            var source = normalizedKey + " " + (streamUrl ?? string.Empty).ToLowerInvariant();
+            if (Regex.IsMatch(source, @"(?:^|[^a-z0-9])(origin|origion|or4)(?:[^a-z0-9]|$)"))
+                return "origin";
+            if (Regex.IsMatch(source, @"(?:^|[^a-z0-9])full_?hd1?(?:[^a-z0-9]|$)"))
+                return "blu_ray";
+            if (Regex.IsMatch(source, @"(?:^|[^a-z0-9])hd1(?:[^a-z0-9]|$)"))
+                return "uhd";
+            if (Regex.IsMatch(source, @"(?:^|[^a-z0-9])uhd(?:[^a-z0-9]|$)"))
+                return "uhd";
+            if (Regex.IsMatch(source, @"(?:^|[^a-z0-9])hd(?:[^a-z0-9]|$)"))
+                return "hd";
+            if (Regex.IsMatch(source, @"(?:^|[^a-z0-9])sd1(?:[^a-z0-9]|$)"))
+                return "sd";
+            if (Regex.IsMatch(source, @"(?:^|[^a-z0-9])sd2(?:[^a-z0-9]|$)"))
+                return "hd";
+            if (Regex.IsMatch(source, @"(?:^|[^a-z0-9])ld(?:[^a-z0-9]|$)"))
+                return "ld";
+            return normalizedKey;
         }
 
         private string BuildFfmpegArguments(string streamUrl, string outputPath, string extension, string segmentMode, int segmentMinutes, long maxBytes, string platform)

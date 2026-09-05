@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using Microsoft.Win32;
 using Forms = System.Windows.Forms;
@@ -29,6 +30,7 @@ namespace LiveBoard
         private string _mediaLastSpeed;
         private string _mediaLastEta;
         private string _mediaFailureLog;
+        private int _mediaProgressRunId;
 
         private void InitializeMediaWorkspace()
         {
@@ -99,6 +101,7 @@ namespace LiveBoard
             StartMediaButton.IsEnabled = false;
             var cancellation = new CancellationTokenSource();
             _mediaCancellation = cancellation;
+            var progressRunId = ++_mediaProgressRunId;
             SetMediaBusy(true, "解析中");
             SetMediaStatus("正在解析媒体", "正在识别网页中可导出的媒体资源", "解析中", "…", FindBrush("BrightGreenBrush"));
 
@@ -110,7 +113,7 @@ namespace LiveBoard
                     GetMediaProxy(),
                     _bilibili.ExportNetscapeCookies(),
                     cancellation.Token,
-                    CreateMediaProgressHandler());
+                    CreateMediaProgressHandler(progressRunId));
                 if (cancellation.IsCancellationRequested)
                 {
                     SetMediaStatus("已取消解析", "", "已取消", "·", FindBrush("LineBrush"));
@@ -139,7 +142,7 @@ namespace LiveBoard
                 MediaTaskTitleText.Text = MediaTitleText.Text;
                 MediaTaskTitleText.ToolTip = result.Title;
                 MediaAnalyzeStateText.Text = "解析完成";
-                if (result.Formats.Count > 0)
+                if (result.AssetCount == 1 && result.Formats.Count > 0)
                 {
                     MediaQualityCombo.ItemsSource = result.Formats;
                     MediaQualityCombo.SelectedIndex = 0;
@@ -147,7 +150,10 @@ namespace LiveBoard
                     MediaFormatHintText.Text = result.Platform == "Bilibili" ? "B站账号权限决定可选画质" : "按原始媒体流导出";
                 }
                 else
-                    MediaFormatHintText.Text = "所选媒体按原始文件导出";
+                {
+                    MediaQualityPanel.Visibility = Visibility.Collapsed;
+                    MediaFormatHintText.Text = result.Assets.Any(asset => asset.HasFormats) ? "每个视频可单独选择画质" : "所选媒体按原始文件导出";
+                }
                 SetMediaStatus("媒体已就绪", result.Platform + " · " + result.AssetCount + " 个可导出媒体", "已就绪", "✓", FindBrush("MintBrush"));
             }
             catch (OperationCanceledException)
@@ -160,6 +166,8 @@ namespace LiveBoard
             }
             finally
             {
+                if (_mediaProgressRunId == progressRunId)
+                    _mediaProgressRunId++;
                 if (ReferenceEquals(_mediaCancellation, cancellation))
                     _mediaCancellation = null;
                 cancellation.Dispose();
@@ -189,8 +197,11 @@ namespace LiveBoard
             }
 
             var format = MediaQualityCombo.SelectedItem as MediaFormatOption;
+            if (selectedAssets.Count == 1 && format != null)
+                selectedAssets[0].SelectedFormat = format;
             var cancellation = new CancellationTokenSource();
             _mediaCancellation = cancellation;
+            var progressRunId = ++_mediaProgressRunId;
             _mediaFailureLog = null;
             _mediaProgressFloor = 0;
             _mediaProgressTotalAssets = selectedAssets.Count;
@@ -213,7 +224,7 @@ namespace LiveBoard
                     GetMediaProxy(),
                     _bilibili.ExportNetscapeCookies(),
                     cancellation.Token,
-                    CreateMediaProgressHandler());
+                    CreateMediaProgressHandler(progressRunId));
                 if (result.Cancelled)
                 {
                     SetMediaStatus("已取消导出", "已下载的完整文件会保留", "已取消", "·", FindBrush("LineBrush"));
@@ -225,7 +236,7 @@ namespace LiveBoard
                     AddActivity("媒体导出失败", ShortenStatus(result.ErrorText));
                     return;
                 }
-                if (result.PartialSuccess)
+                if (result.PartialSuccess && result.DownloadedCount < selectedAssets.Count)
                 {
                     var total = Math.Max(result.DownloadedCount, selectedAssets.Count);
                     MediaProgressBar.IsIndeterminate = false;
@@ -234,9 +245,11 @@ namespace LiveBoard
                     AddActivity("媒体部分导出完成", result.DownloadedCount + "/" + total + " 个文件已保存");
                     return;
                 }
+                _mediaProgressFloor = 100;
+                _mediaCurrentPercent = 100;
                 MediaProgressBar.IsIndeterminate = false;
                 MediaProgressBar.Value = 100;
-                SetMediaStatus("导出完成", result.DownloadedCount + " 个媒体已保存", "已完成", "✓", FindBrush("BrightGreenBrush"));
+                SetMediaStatus("导出完成", result.DownloadedCount + " 个媒体已保存", "100%", "✓", FindBrush("BrightGreenBrush"));
                 AddActivity("媒体导出完成", _mediaAnalysis.Platform + " · " + result.DownloadedCount + " 个文件");
             }
             catch (OperationCanceledException)
@@ -249,6 +262,8 @@ namespace LiveBoard
             }
             finally
             {
+                if (_mediaProgressRunId == progressRunId)
+                    _mediaProgressRunId++;
                 if (ReferenceEquals(_mediaCancellation, cancellation))
                     _mediaCancellation = null;
                 cancellation.Dispose();
@@ -359,7 +374,24 @@ namespace LiveBoard
         {
             var quality = MediaQualityCombo.SelectedItem as MediaFormatOption;
             if (quality != null)
+            {
                 MediaFormatHintText.Text = quality.Label;
+                if (_mediaAnalysis != null && _mediaAnalysis.Assets.Count == 1)
+                    _mediaAnalysis.Assets[0].SelectedFormat = quality;
+            }
+        }
+
+        private void MediaAssetQuality_OnChanged(object sender, SelectionChangedEventArgs e)
+        {
+            var combo = sender as ComboBox;
+            var quality = combo == null ? null : combo.SelectedItem as MediaFormatOption;
+            if (quality != null)
+                MediaFormatHintText.Text = "已选择 " + quality.Label;
+        }
+
+        private void MediaQualityCombo_OnPreviewMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            e.Handled = true;
         }
 
         private void MediaAssetSelection_OnClick(object sender, RoutedEventArgs e)
@@ -441,7 +473,7 @@ namespace LiveBoard
             return _mediaProxyPlaceholder ? null : (MediaProxyBox.Text ?? string.Empty).Trim();
         }
 
-        private Action<string> CreateMediaProgressHandler()
+        private Action<string> CreateMediaProgressHandler(int progressRunId)
         {
             return delegate(string line)
             {
@@ -449,6 +481,8 @@ namespace LiveBoard
                     return;
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
+                    if (progressRunId != _mediaProgressRunId)
+                        return;
                     if (line.StartsWith("__RH_OUTPUT__", StringComparison.OrdinalIgnoreCase))
                     {
                         _mediaCompletedAssets = Math.Min(_mediaProgressTotalAssets, _mediaCompletedAssets + 1);
