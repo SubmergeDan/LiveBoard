@@ -165,7 +165,7 @@ namespace LiveBoard
         private static readonly Regex VideoSourceRegex = new Regex(@"<(?:video|source)\b[^>]*\b(?:src|data-src)\s*=\s*(?:\""(?<url>[^\""\r\n]+)\""|'(?<url>[^'\r\n]+)'|(?<url>[^\s>]+))", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private readonly JavaScriptSerializer _serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
-        public async Task<MediaAnalysisResult> AnalyzeAsync(string input, string cookieBrowser, string proxy, string bilibiliCookies, CancellationToken cancellationToken, Action<string> progress)
+        public async Task<MediaAnalysisResult> AnalyzeAsync(string input, MediaCookieSource cookieSource, string proxy, string bilibiliCookies, CancellationToken cancellationToken, Action<string> progress)
         {
             var url = ExtractUrl(input);
             if (string.IsNullOrWhiteSpace(url))
@@ -201,45 +201,44 @@ namespace LiveBoard
                     return await AnalyzeDouyinNoteAsync(url, effectiveProxy, cancellationToken, progress);
             }
 
-            string cookiePath = null;
+            CookiePlan cookiePlan = null;
             try
             {
-                cookiePath = string.Equals(platform, "抖音", StringComparison.OrdinalIgnoreCase)
-                    ? await CreateDouyinCookieFileAsync(effectiveProxy, cancellationToken, progress)
-                    : CreateCookieFile(bilibiliCookies, platform == "Bilibili");
+                cookiePlan = await BuildCookiePlanAsync(cookieSource, platform, url, effectiveProxy, bilibiliCookies, cancellationToken, progress);
                 if (platform == "快手")
-                    return await AnalyzeKuaishouAsync(url, effectiveProxy, cancellationToken, progress);
+                    return ApplyNotice(await AnalyzeKuaishouAsync(url, effectiveProxy, cancellationToken, progress), cookiePlan.Notice);
                 if (platform == "X" || platform == "Instagram")
                 {
                     ReportProgress(progress, "正在读取帖子媒体");
-                    var gallery = await AnalyzeGalleryAsync(url, platform, cookieBrowser, effectiveProxy, cancellationToken, progress);
+                    var gallery = await AnalyzeGalleryAsync(url, platform, cookiePlan, effectiveProxy, cancellationToken, progress);
                     if (gallery.Success && gallery.AssetCount > 0)
                     {
                         if (gallery.AssetCount == 1 && IsVideo(gallery.Assets[0]))
                         {
-                            var video = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
+                            var video = await AnalyzeYtDlpAsync(url, platform, cookiePlan, effectiveProxy, cancellationToken, progress);
                             if (video.Success)
                                 return video;
                         }
                         return gallery;
                     }
 
-                    var fallback = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
-                    return fallback.Success ? fallback : Failure(url, CombineErrors(gallery.ErrorText, fallback.ErrorText));
+                    var fallback = await AnalyzeYtDlpAsync(url, platform, cookiePlan, effectiveProxy, cancellationToken, progress);
+                    return fallback.Success ? fallback : ApplyNotice(Failure(url, CombineErrors(gallery.ErrorText, fallback.ErrorText)), cookiePlan.Notice);
                 }
 
                 if (string.Equals(platform, "网页", StringComparison.OrdinalIgnoreCase))
                 {
-                    var ytDlp = await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
+                    var ytDlp = await AnalyzeYtDlpAsync(url, platform, cookiePlan, effectiveProxy, cancellationToken, progress);
                     if (ytDlp.Success)
                         return ytDlp;
                     var page = await AnalyzeGenericWebPageAsync(url, effectiveProxy, cancellationToken, progress);
                     if (page.Success && page.AssetCount > 0)
                         return page;
-                    return page.Success ? page : Failure(url, CombineErrors(ytDlp.ErrorText, page.ErrorText));
+                    return page.Success ? page : ApplyNotice(Failure(url, CombineErrors(ytDlp.ErrorText, page.ErrorText)), cookiePlan.Notice);
                 }
 
-                return await AnalyzeYtDlpAsync(url, platform, cookieBrowser, effectiveProxy, cookiePath, cancellationToken, progress);
+                var single = await AnalyzeYtDlpAsync(url, platform, cookiePlan, effectiveProxy, cancellationToken, progress);
+                return ApplyNotice(single, cookiePlan.Notice);
             }
             catch (OperationCanceledException)
             {
@@ -247,15 +246,16 @@ namespace LiveBoard
             }
             catch (Exception ex)
             {
-                return Failure(url, MapError(ex.Message, platform));
+                return ApplyNotice(Failure(url, MapError(ex.Message, platform)), cookiePlan == null ? null : cookiePlan.Notice);
             }
             finally
             {
-                DeleteQuietly(cookiePath);
+                if (cookiePlan != null)
+                    cookiePlan.Dispose();
             }
         }
 
-        public async Task<MediaExportResult> ExportAsync(MediaAnalysisResult analysis, IList<MediaAssetInfo> selectedAssets, MediaFormatOption format, string outputDirectory, string cookieBrowser, string proxy, string bilibiliCookies, CancellationToken cancellationToken, Action<string> progress)
+        public async Task<MediaExportResult> ExportAsync(MediaAnalysisResult analysis, IList<MediaAssetInfo> selectedAssets, MediaFormatOption format, string outputDirectory, MediaCookieSource cookieSource, string proxy, string bilibiliCookies, CancellationToken cancellationToken, Action<string> progress)
         {
             if (analysis == null || !analysis.Success)
                 return new MediaExportResult { ErrorText = "还没有可导出的媒体。" };
@@ -266,15 +266,13 @@ namespace LiveBoard
                 outputDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
             Directory.CreateDirectory(outputDirectory);
 
-            string cookiePath = null;
+            CookiePlan cookiePlan = null;
             try
             {
                 var effectiveProxy = ResolveProxy(proxy, GetDownloadUrl(analysis, selectedAssets));
                 if (string.Equals(analysis.Engine, "direct-image", StringComparison.OrdinalIgnoreCase))
                     return await ExportDirectImagesAsync(analysis, selectedAssets, outputDirectory, effectiveProxy, cancellationToken, progress);
-                cookiePath = string.Equals(analysis.Platform, "抖音", StringComparison.OrdinalIgnoreCase)
-                    ? await CreateDouyinCookieFileAsync(effectiveProxy, cancellationToken, progress)
-                    : CreateCookieFile(bilibiliCookies, string.Equals(analysis.Platform, "Bilibili", StringComparison.OrdinalIgnoreCase));
+                cookiePlan = await BuildCookiePlanAsync(cookieSource, analysis.Platform, analysis.Url, effectiveProxy, bilibiliCookies, cancellationToken, progress);
                 var before = SafeFileCount(outputDirectory);
                 MediaToolResult run;
                 if (string.Equals(analysis.Engine, "gallery-dl", StringComparison.OrdinalIgnoreCase))
@@ -285,7 +283,7 @@ namespace LiveBoard
                         "--config-ignore", "--no-input", "--no-colors", "--windows-filenames", "--no-mtime",
                         "--range", BuildItemSelection(selectedAssets), "--Print", "after:__RH_OUTPUT__", "--directory", outputDirectory
                     };
-                    AddCookieArguments(arguments, cookieBrowser, cookiePath);
+                    AddCookieArguments(arguments, cookiePlan);
                     AddProxyArgument(arguments, effectiveProxy);
                     arguments.Add(analysis.Url);
                     ReportProgress(progress, "正在下载帖子媒体");
@@ -294,7 +292,7 @@ namespace LiveBoard
                 else
                 {
                     var ytPath = EnsureYtDlp();
-                    run = await DownloadYtDlpAssetsAsync(analysis, selectedAssets, format, ytPath, outputDirectory, cookieBrowser, cookiePath, effectiveProxy, cancellationToken, progress);
+                    run = await DownloadYtDlpAssetsAsync(analysis, selectedAssets, format, ytPath, outputDirectory, cookiePlan, effectiveProxy, cancellationToken, progress);
                 }
 
                 if (run.Cancelled || cancellationToken.IsCancellationRequested)
@@ -326,12 +324,12 @@ namespace LiveBoard
                 }
                 if (run.ExitCode != 0)
                 {
-                    return new MediaExportResult
+                    return ApplyNotice(new MediaExportResult
                     {
                         ErrorText = MapError(run.StandardError, analysis.Platform),
                         LogText = BuildToolLog(run),
                         OutputDirectory = outputDirectory
-                    };
+                    }, cookiePlan.Notice);
                 }
                 return new MediaExportResult
                 {
@@ -346,20 +344,21 @@ namespace LiveBoard
             }
             catch (Exception ex)
             {
-                return new MediaExportResult
+                return ApplyNotice(new MediaExportResult
                 {
                     ErrorText = MapError(ex.Message, analysis.Platform),
                     LogText = ex.ToString(),
                     OutputDirectory = outputDirectory
-                };
+                }, cookiePlan == null ? null : cookiePlan.Notice);
             }
             finally
             {
-                DeleteQuietly(cookiePath);
+                if (cookiePlan != null)
+                    cookiePlan.Dispose();
             }
         }
 
-        private async Task<MediaToolResult> DownloadYtDlpAssetsAsync(MediaAnalysisResult analysis, IList<MediaAssetInfo> selectedAssets, MediaFormatOption fallbackFormat, string ytPath, string outputDirectory, string cookieBrowser, string cookiePath, string proxy, CancellationToken cancellationToken, Action<string> progress)
+        private async Task<MediaToolResult> DownloadYtDlpAssetsAsync(MediaAnalysisResult analysis, IList<MediaAssetInfo> selectedAssets, MediaFormatOption fallbackFormat, string ytPath, string outputDirectory, CookiePlan cookiePlan, string proxy, CancellationToken cancellationToken, Action<string> progress)
         {
             var groups = string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase)
                 ? new List<IList<MediaAssetInfo>> { selectedAssets }
@@ -383,7 +382,7 @@ namespace LiveBoard
                     "-o", "%(autonumber)03d_%(title).80B_%(id).32B.%(ext)s"
                 };
                 if (!string.Equals(analysis.Engine, "direct", StringComparison.OrdinalIgnoreCase))
-                    AddCookieArguments(arguments, cookieBrowser, cookiePath);
+                    AddCookieArguments(arguments, cookiePlan);
                 AddPlatformRequestArguments(arguments, analysis.Platform, analysis.Url);
                 if (string.Equals(analysis.Engine, "yt-dlp-impersonate", StringComparison.OrdinalIgnoreCase))
                 {
@@ -917,7 +916,7 @@ namespace LiveBoard
             throw lastError ?? new HttpRequestException("抖音图片服务器没有返回媒体信息。");
         }
 
-        private async Task<MediaAnalysisResult> AnalyzeYtDlpAsync(string url, string platform, string cookieBrowser, string proxy, string cookiePath, CancellationToken cancellationToken, Action<string> progress)
+        private async Task<MediaAnalysisResult> AnalyzeYtDlpAsync(string url, string platform, CookiePlan cookiePlan, string proxy, CancellationToken cancellationToken, Action<string> progress)
         {
             try
             {
@@ -927,7 +926,7 @@ namespace LiveBoard
                     "--ignore-config", "--dump-single-json", "--skip-download", "--no-warnings", "--playlist-end", MaxPageMediaAssets.ToString(CultureInfo.InvariantCulture), "--no-colors",
                     "--encoding", "utf-8", "--socket-timeout", "30"
                 };
-                AddCookieArguments(arguments, cookieBrowser, cookiePath);
+                AddCookieArguments(arguments, cookiePlan);
                 AddPlatformRequestArguments(arguments, platform, url);
                 AddProxyArgument(arguments, proxy);
                 arguments.Add(url);
@@ -1108,6 +1107,13 @@ namespace LiveBoard
                             var baseUri = response.RequestMessage == null ? new Uri(url) : response.RequestMessage.RequestUri;
                             var mediaUrls = ExtractGenericMediaUrls(html, baseUri);
                             if (mediaUrls.Count == 0)
+                            {
+                                // 页面源码里没有媒体地址时，尝试站点播放接口（EmpireCMS + moyublog 播放器）。
+                                var playerUrls = await TryResolvePlayerMediaAsync(html, baseUri, client, cancellationToken, progress);
+                                if (playerUrls.Count > 0)
+                                    mediaUrls.AddRange(playerUrls);
+                            }
+                            if (mediaUrls.Count == 0)
                                 return Failure(url, "网页未包含可直接导出的媒体流；动态加载、登录限制或 DRM 加密的视频无法通过网页源码提取。");
 
                             var title = ExtractOpenGraphValue(html, "og:title");
@@ -1155,6 +1161,81 @@ namespace LiveBoard
             {
                 return Failure(url, MapError(ex.Message, "网页"));
             }
+        }
+
+        /// <summary>
+        /// 有些站点（EmpireCMS + moyublog 播放器插件）不在页面源码里给出媒体地址：
+        /// 页面只有 &lt;div class="buyvideo" classid=".." xxid=".."&gt;，
+        /// 由 JS 向 /e/moyublog/bofang/ 发 POST 拿到播放器 iframe，媒体地址藏在 iframe 页面里。
+        /// 这里复现同样的两步请求，失败也不影响其它解析路径。
+        /// </summary>
+        private static async Task<IList<string>> TryResolvePlayerMediaAsync(string html, Uri baseUri, HttpClient client, CancellationToken cancellationToken, Action<string> progress)
+        {
+            var urls = new List<string>();
+            try
+            {
+                var tag = Regex.Match(html ?? string.Empty,
+                    "<[^>]*\\bclass\\s*=\\s*[\"'][^\"']*\\bbuyvideo\\b[^\"']*[\"'][^>]*>",
+                    RegexOptions.IgnoreCase);
+                if (!tag.Success)
+                    return urls;
+
+                var classId = ReadHtmlAttribute(tag.Value, "classid");
+                var mediaId = ReadHtmlAttribute(tag.Value, "xxid");
+                if (string.IsNullOrWhiteSpace(classId) || string.IsNullOrWhiteSpace(mediaId))
+                    return urls;
+
+                ReportProgress(progress, "正在通过站点播放接口获取视频地址");
+                var endpoint = new Uri(baseUri, "/e/moyublog/bofang/");
+                var fields = new List<KeyValuePair<string, string>>
+                {
+                    new KeyValuePair<string, string>("id", mediaId),
+                    new KeyValuePair<string, string>("classid", classId)
+                };
+                using (var content = new FormUrlEncodedContent(fields))
+                using (var request = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content })
+                {
+                    request.Headers.Referrer = baseUri;
+                    request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
+                    using (var response = await client.SendAsync(request, cancellationToken))
+                    {
+                        response.EnsureSuccessStatusCode();
+                        var body = await ReadPageTextAsync(response.Content, cancellationToken);
+                        // 接口返回的是 JSON 字符串，里面的 HTML 是转义过的：
+                        // 引号写成 \"、斜杠写成 \/，必须先还原再解析，否则取不到 iframe 地址。
+                        var playerMarkup = (body ?? string.Empty).Replace("\\\"", "\"").Replace("\\/", "/");
+                        var iframe = Regex.Match(playerMarkup,
+                            "<iframe\\b[^>]*\\bsrc\\s*=\\s*(?:\"(?<url>[^\"]+)\"|'(?<url>[^']+)'|(?<url>[^\\s>]+))",
+                            RegexOptions.IgnoreCase);
+                        if (!iframe.Success)
+                            return urls;
+
+                        var playerUrl = new Uri(baseUri, iframe.Groups["url"].Value.Trim());
+                        using (var playerResponse = await client.GetAsync(playerUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                        {
+                            playerResponse.EnsureSuccessStatusCode();
+                            var playerHtml = await ReadPageTextAsync(playerResponse.Content, cancellationToken);
+                            urls.AddRange(ExtractGenericMediaUrls(playerHtml, playerUrl));
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+            }
+            return urls;
+        }
+
+        private static string ReadHtmlAttribute(string tag, string name)
+        {
+            var match = Regex.Match(tag ?? string.Empty,
+                "\\b" + Regex.Escape(name) + "\\s*=\\s*(?:\"(?<value>[^\"]*)\"|'(?<value>[^']*)'|(?<value>[^\\s>]+))",
+                RegexOptions.IgnoreCase);
+            return match.Success ? match.Groups["value"].Value : null;
         }
 
         private static async Task<string> ReadPageTextAsync(HttpContent content, CancellationToken cancellationToken)
@@ -1636,7 +1717,7 @@ namespace LiveBoard
             }
         }
 
-        private async Task<MediaAnalysisResult> AnalyzeGalleryAsync(string url, string platform, string cookieBrowser, string proxy, CancellationToken cancellationToken, Action<string> progress)
+        private async Task<MediaAnalysisResult> AnalyzeGalleryAsync(string url, string platform, CookiePlan cookiePlan, string proxy, CancellationToken cancellationToken, Action<string> progress)
         {
             try
             {
@@ -1645,7 +1726,7 @@ namespace LiveBoard
                 {
                     "--config-ignore", "--no-input", "--no-colors", "--range", "1-1000", "--dump-json"
                 };
-                AddCookieArguments(arguments, cookieBrowser, null);
+                AddCookieArguments(arguments, cookiePlan);
                 AddProxyArgument(arguments, proxy);
                 arguments.Add(url);
                 var run = await RunToolAsync(path, arguments, cancellationToken, progress);
@@ -1737,11 +1818,18 @@ namespace LiveBoard
                 if (string.IsNullOrWhiteSpace(id) || height <= 0 || string.Equals(vcodec, "none", StringComparison.OrdinalIgnoreCase))
                     continue;
                 var shortSide = width > 0 ? Math.Min(width, height) : height;
-                var note = FirstString(format, "format_note");
+                var note = string.Equals(platform, "Bilibili", StringComparison.OrdinalIgnoreCase)
+                    ? FirstString(format, "format", "format_note")
+                    : FirstString(format, "format_note");
                 if (string.Equals(platform, "抖音", StringComparison.OrdinalIgnoreCase) &&
                     (note ?? string.Empty).IndexOf("(API)", StringComparison.OrdinalIgnoreCase) >= 0)
                     continue;
                 var quality = QualityLabel(note, shortSide);
+                var fps = GetDouble(format, "fps");
+                if (string.Equals(platform, "Bilibili", StringComparison.OrdinalIgnoreCase) && fps >= 50 &&
+                    quality.IndexOf("帧", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    quality.IndexOf("fps", StringComparison.OrdinalIgnoreCase) < 0)
+                    quality += " " + Math.Round(fps).ToString(CultureInfo.InvariantCulture) + "帧";
                 var codec = vcodec ?? string.Empty;
                 var codecScore = codec.IndexOf("avc", StringComparison.OrdinalIgnoreCase) >= 0 || codec.IndexOf("h264", StringComparison.OrdinalIgnoreCase) >= 0 ? 300 :
                                  codec.IndexOf("hevc", StringComparison.OrdinalIgnoreCase) >= 0 || codec.IndexOf("h265", StringComparison.OrdinalIgnoreCase) >= 0 ? 200 : 100;
@@ -1752,16 +1840,20 @@ namespace LiveBoard
                     Label = quality,
                     Width = width,
                     Height = height,
+                    Fps = fps,
                     HasAudio = !string.Equals(acodec, "none", StringComparison.OrdinalIgnoreCase),
                     Score = codecScore + (int)Math.Min(100, tbr / 100)
                 });
             }
 
             formats.Add(new MediaFormatOption { FormatId = "best", Selector = "bestvideo+bestaudio/best", Label = "最佳可用画质" });
-            foreach (var group in candidates.GroupBy(item => item.Label).OrderByDescending(item => item.Max(value => value.Width > 0 ? Math.Min(value.Width, value.Height) : value.Height)))
+            foreach (var group in candidates.GroupBy(item => item.Label)
+                .OrderByDescending(item => item.Max(value => value.Width > 0 ? Math.Min(value.Width, value.Height) : value.Height))
+                .ThenByDescending(item => item.Max(value => value.Fps)))
             {
                 var selected = group
                     .OrderByDescending(item => item.Width > 0 ? Math.Min(item.Width, item.Height) : item.Height)
+                    .ThenByDescending(item => item.Fps)
                     .ThenByDescending(item => item.Score)
                     .First();
                 formats.Add(new MediaFormatOption
@@ -1780,6 +1872,7 @@ namespace LiveBoard
             public string Label;
             public int Width;
             public int Height;
+            public double Fps;
             public bool HasAudio;
             public int Score;
         }
@@ -2043,22 +2136,130 @@ namespace LiveBoard
             return path;
         }
 
-        private static void AddCookieArguments(IList<string> arguments, string browser, string cookiePath)
+        /// <summary>
+        /// 一次任务里实际使用的登录态来源。优先级：B站账号 &gt; 内置登录保存的登录态 &gt; 导入的 cookies.txt &gt; 浏览器。
+        /// </summary>
+        private sealed class CookiePlan : IDisposable
         {
-            if (!string.IsNullOrWhiteSpace(cookiePath))
+            public string FilePath { get; set; }
+            public bool OwnsFile { get; set; }
+            public string Browser { get; set; }
+            public string Notice { get; set; }
+
+            public void Dispose()
             {
-                arguments.Add("--cookies");
-                arguments.Add(cookiePath);
+                if (OwnsFile)
+                    DeleteQuietly(FilePath);
             }
-            else
+        }
+
+        private async Task<CookiePlan> BuildCookiePlanAsync(MediaCookieSource source, string platform, string targetUrl, string proxy, string bilibiliCookies, CancellationToken cancellationToken, Action<string> progress)
+        {
+            var plan = new CookiePlan();
+            if (string.Equals(platform, "抖音", StringComparison.OrdinalIgnoreCase))
             {
-                var value = BrowserValue(browser);
-                if (!string.IsNullOrWhiteSpace(value))
+                var douyinPath = await CreateDouyinCookieFileAsync(proxy, cancellationToken, progress);
+                if (!string.IsNullOrWhiteSpace(douyinPath))
                 {
-                    arguments.Add("--cookies-from-browser");
-                    arguments.Add(value);
+                    plan.FilePath = douyinPath;
+                    plan.OwnsFile = true;
+                    return plan;
                 }
             }
+
+            if (string.Equals(platform, "Bilibili", StringComparison.OrdinalIgnoreCase))
+            {
+                var bilibiliPath = CreateCookieFile(bilibiliCookies, true);
+                if (!string.IsNullOrWhiteSpace(bilibiliPath))
+                {
+                    plan.FilePath = bilibiliPath;
+                    plan.OwnsFile = true;
+                    return plan;
+                }
+            }
+
+            string stored;
+            if (source != null && source.PlatformCookies != null && !string.IsNullOrWhiteSpace(platform) &&
+                source.PlatformCookies.TryGetValue(platform, out stored) && !string.IsNullOrWhiteSpace(stored))
+            {
+                plan.FilePath = WriteCookieText(stored);
+                plan.OwnsFile = true;
+                return plan;
+            }
+
+            if (source != null && !string.IsNullOrWhiteSpace(source.CookieFilePath) && File.Exists(source.CookieFilePath))
+            {
+                plan.FilePath = source.CookieFilePath;
+                return plan;
+            }
+
+            var browserLabel = source == null ? null : source.Selected;
+            if (string.IsNullOrWhiteSpace(browserLabel) ||
+                string.Equals(browserLabel, BrowserCookieService.NoBrowserSource, StringComparison.OrdinalIgnoreCase))
+                return plan;
+
+            if (string.Equals(browserLabel, BrowserCookieService.CookieFileSource, StringComparison.OrdinalIgnoreCase))
+            {
+                plan.Notice = "已选择从 cookies.txt 导入登录状态，但还没有选择有效的文件。";
+                return plan;
+            }
+
+            // 浏览器的 Cookie 数据库经常无法被 yt-dlp 读取：
+            //   - 被运行中的浏览器独占锁定 → 提示用户退出浏览器；
+            //   - Cookie 是 v20 App-Bound 加密 → 任何第三方进程（包括带调试端口的浏览器实例）
+            //     都无法解密，只能改用 cookies.txt 导出或 Firefox。
+            var report = BrowserCookieService.Inspect(browserLabel);
+            if (report.IsUsable)
+            {
+                plan.Browser = BrowserCookieService.BrowserValue(browserLabel);
+                return plan;
+            }
+
+            plan.Notice = report.Detail;
+            return plan;
+        }
+
+        private string WriteCookieText(string cookieText)
+        {
+            var path = Path.Combine(Path.GetTempPath(), "LiveBoard-media-" + Guid.NewGuid().ToString("N") + ".txt");
+            File.WriteAllText(path, cookieText, new UTF8Encoding(false));
+            return path;
+        }
+
+        private static void AddCookieArguments(IList<string> arguments, CookiePlan plan)
+        {
+            if (plan != null && !string.IsNullOrWhiteSpace(plan.FilePath))
+            {
+                arguments.Add("--cookies");
+                arguments.Add(plan.FilePath);
+                return;
+            }
+            if (plan != null && !string.IsNullOrWhiteSpace(plan.Browser))
+            {
+                arguments.Add("--cookies-from-browser");
+                arguments.Add(plan.Browser);
+            }
+        }
+
+        private static string WithNotice(string message, string notice)
+        {
+            if (string.IsNullOrWhiteSpace(notice))
+                return message;
+            return string.IsNullOrWhiteSpace(message) ? notice : notice + " " + message;
+        }
+
+        private static MediaAnalysisResult ApplyNotice(MediaAnalysisResult result, string notice)
+        {
+            if (result != null && !result.Success && !string.IsNullOrWhiteSpace(notice))
+                result.ErrorText = WithNotice(result.ErrorText, notice);
+            return result;
+        }
+
+        private static MediaExportResult ApplyNotice(MediaExportResult result, string notice)
+        {
+            if (result != null && !result.Success && !string.IsNullOrWhiteSpace(notice))
+                result.ErrorText = WithNotice(result.ErrorText, notice);
+            return result;
         }
 
         private static void AddPlatformRequestArguments(IList<string> arguments, string platform, string referer)
@@ -2112,18 +2313,25 @@ namespace LiveBoard
             }
         }
 
-        private static string BrowserValue(string browser)
-        {
-            if (string.Equals(browser, "Microsoft Edge", StringComparison.OrdinalIgnoreCase)) return "edge";
-            if (string.Equals(browser, "Google Chrome", StringComparison.OrdinalIgnoreCase)) return "chrome";
-            if (string.Equals(browser, "Mozilla Firefox", StringComparison.OrdinalIgnoreCase)) return "firefox";
-            return null;
-        }
-
         private static int SafeFileCount(string directory)
         {
             try { return Directory.GetFiles(directory, "*", SearchOption.TopDirectoryOnly).Length; }
             catch { return 0; }
+        }
+
+        public static string DetectPlatformFor(string url)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri))
+                return null;
+            try
+            {
+                return DetectPlatform(url);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static string DetectPlatform(string url)
@@ -2211,14 +2419,22 @@ namespace LiveBoard
         private static string MapError(string text, string platform)
         {
             var value = (text ?? string.Empty).Replace("\r", " ").Replace("\n", " ").Trim();
+            if (value.IndexOf("Could not copy", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                value.IndexOf("cookie database", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "无法读取浏览器 Cookie 数据库：浏览器正在运行并独占了该文件，yt-dlp 无法复制。" +
+                       "请先完全退出该浏览器后重试，或改用「" + BrowserCookieService.CookieFileSource + "」导入登录态。";
+            if (value.IndexOf("Failed to decrypt with DPAPI", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("could not be decrypted", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "浏览器 Cookie 使用 App-Bound 加密，yt-dlp 无法解密，因此拿不到登录状态。" +
+                       "请用浏览器扩展导出「" + BrowserCookieService.CookieFileSource + "」后导入。";
             if (value.IndexOf("Fresh cookies", StringComparison.OrdinalIgnoreCase) >= 0 || value.IndexOf("cookies-from-browser", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 if (string.Equals(platform, "抖音", StringComparison.OrdinalIgnoreCase) || string.Equals(platform, "快手", StringComparison.OrdinalIgnoreCase) || string.Equals(platform, "X", StringComparison.OrdinalIgnoreCase))
                     return platform + " 暂时无法读取该媒体，可能受到平台风控或网络限制；登录来源不是必需项。";
-                return platform + " 可能需要登录状态，请在登录来源中选择已登录的 Edge、Chrome 或 Firefox。";
+                return platform + " 可能需要登录状态，请用浏览器扩展导出 cookies.txt 后点击「导入 cookies.txt」。";
             }
             if (value.IndexOf("empty media response", StringComparison.OrdinalIgnoreCase) >= 0 || value.IndexOf("redirect to login", StringComparison.OrdinalIgnoreCase) >= 0)
-                return platform + " 当前需要登录或受到地区限制，请选择浏览器登录状态并保持代理可用。";
+                return platform + " 当前需要登录或受到地区限制，请导入 cookies.txt 或使用内置登录，并保持代理可用。";
             if (value.IndexOf("IncompleteRead", StringComparison.OrdinalIgnoreCase) >= 0 || value.IndexOf("more expected", StringComparison.OrdinalIgnoreCase) >= 0)
                 return "媒体服务器提前中断了数据传输；LiveBoard 已自动续传重试，仍未完成的媒体可稍后再次导出。";
             if (value.Length == 0) return "平台没有返回可下载的媒体。";

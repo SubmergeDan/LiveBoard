@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.Serialization;
@@ -296,6 +297,14 @@ namespace LiveBoard
         [DataMember(Order = 12)]
         public bool QueueExplicitlyCleared { get; set; }
 
+        /// <summary>用户导入的 Netscape 格式 cookies.txt 路径。</summary>
+        [DataMember(Order = 13)]
+        public string MediaCookieFile { get; set; }
+
+        /// <summary>平台名 -&gt; 该平台的 Netscape Cookie 文本（DPAPI 加密后存放）。</summary>
+        [DataMember(Order = 14)]
+        public Dictionary<string, string> MediaPlatformCookies { get; set; }
+
         public static AppConfig CreateDefault()
         {
             return new AppConfig
@@ -307,7 +316,48 @@ namespace LiveBoard
                 DefaultPlatform = "抖音",
                 MediaOutputDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
                 MediaCookieBrowser = "不使用浏览器登录",
+                MediaPlatformCookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
                 Rooms = new ObservableCollection<RoomConfig>()
+            };
+        }
+    }
+
+    /// <summary>
+    /// 一次解析/导出任务实际使用的登录态来源。
+    /// 浏览器 Cookie 在现代 Chromium 上经常不可读（独占锁定 + v20 App-Bound 加密），
+    /// 因此这里同时携带 cookies.txt 与内置登录保存的登录态。
+    /// </summary>
+    public sealed class MediaCookieSource
+    {
+        public string Selected { get; set; }
+        public string CookieFilePath { get; set; }
+        public Dictionary<string, string> PlatformCookies { get; set; }
+
+        public static MediaCookieSource FromConfig(AppConfig config)
+        {
+            if (config == null)
+                return new MediaCookieSource { Selected = BrowserCookieService.NoBrowserSource };
+
+            var cookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (config.MediaPlatformCookies != null)
+            {
+                foreach (var pair in config.MediaPlatformCookies)
+                {
+                    if (string.IsNullOrWhiteSpace(pair.Key) || string.IsNullOrWhiteSpace(pair.Value))
+                        continue;
+                    var plain = ConfigStore.UnprotectSecret(pair.Value);
+                    if (!string.IsNullOrWhiteSpace(plain))
+                        cookies[pair.Key] = plain;
+                }
+            }
+
+            return new MediaCookieSource
+            {
+                Selected = string.IsNullOrWhiteSpace(config.MediaCookieBrowser)
+                    ? BrowserCookieService.NoBrowserSource
+                    : config.MediaCookieBrowser,
+                CookieFilePath = config.MediaCookieFile,
+                PlatformCookies = cookies
             };
         }
     }

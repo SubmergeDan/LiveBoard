@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.Serialization.Json;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace LiveBoard
@@ -146,6 +148,10 @@ namespace LiveBoard
                     config.MediaOutputDirectory = config.OutputDirectory;
                 if (string.IsNullOrWhiteSpace(config.MediaCookieBrowser))
                     config.MediaCookieBrowser = "不使用浏览器登录";
+                if (config.MediaPlatformCookies == null)
+                    config.MediaPlatformCookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (!string.IsNullOrWhiteSpace(config.MediaCookieFile) && !File.Exists(config.MediaCookieFile))
+                    config.MediaCookieFile = null;
                 foreach (var room in config.Rooms)
                 {
                     if (room == null)
@@ -251,6 +257,37 @@ namespace LiveBoard
         public string ReadablePath()
         {
             return ConfigPath;
+        }
+
+        /// <summary>用当前用户的 DPAPI 保护登录态等敏感文本，返回 Base64。</summary>
+        public static string ProtectSecret(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return value;
+            try
+            {
+                var protectedBytes = ProtectedData.Protect(Encoding.UTF8.GetBytes(value), null, DataProtectionScope.CurrentUser);
+                return Convert.ToBase64String(protectedBytes);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public static string UnprotectSecret(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+            try
+            {
+                var bytes = ProtectedData.Unprotect(Convert.FromBase64String(value), null, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(bytes);
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 }

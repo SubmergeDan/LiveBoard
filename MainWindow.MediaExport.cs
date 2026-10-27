@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Globalization;
 using System.Linq;
@@ -34,12 +35,20 @@ namespace LiveBoard
 
         private void InitializeMediaWorkspace()
         {
-            foreach (var item in new[] { "不使用浏览器登录", "Microsoft Edge", "Google Chrome", "Mozilla Firefox" })
+            foreach (var item in new[]
+            {
+                BrowserCookieService.NoBrowserSource,
+                "Microsoft Edge",
+                "Google Chrome",
+                "Mozilla Firefox",
+                BrowserCookieService.CookieFileSource
+            })
                 MediaCookieCombo.Items.Add(item);
             MediaCookieCombo.SelectedIndex = 0;
             MediaOutputPathText.Text = "Videos";
             MediaTaskOutputText.Text = "Videos";
             UpdateMediaBilibiliAccountUi();
+            UpdateMediaCookieHint();
         }
 
         private void LoadMediaWorkspaceSettings()
@@ -48,10 +57,11 @@ namespace LiveBoard
                 return;
             var directory = string.IsNullOrWhiteSpace(_config.MediaOutputDirectory) ? _config.OutputDirectory : _config.MediaOutputDirectory;
             SetMediaOutputDirectory(directory);
-            var browser = string.IsNullOrWhiteSpace(_config.MediaCookieBrowser) ? "不使用浏览器登录" : _config.MediaCookieBrowser;
+            var browser = string.IsNullOrWhiteSpace(_config.MediaCookieBrowser) ? BrowserCookieService.NoBrowserSource : _config.MediaCookieBrowser;
             MediaCookieCombo.SelectedItem = MediaCookieCombo.Items.Cast<object>().Any(item => string.Equals(item as string, browser, StringComparison.OrdinalIgnoreCase))
                 ? browser
-                : "不使用浏览器登录";
+                : BrowserCookieService.NoBrowserSource;
+            UpdateMediaCookieHint();
             if (!string.IsNullOrWhiteSpace(_config.MediaProxy))
             {
                 MediaProxyBox.Text = _config.MediaProxy;
@@ -87,8 +97,10 @@ namespace LiveBoard
                 return;
             }
 
+            EnsureBrowserCookiesReady();
             _mediaAnalysis = null;
             _mediaFailureLog = null;
+            UpdateMediaCookieHint();
             MediaAssetItems.ItemsSource = null;
             MediaAssetItems.Visibility = Visibility.Collapsed;
             MediaQualityCombo.ItemsSource = null;
@@ -109,7 +121,7 @@ namespace LiveBoard
             {
                 var result = await _mediaExporter.AnalyzeAsync(
                     input,
-                    GetMediaCookieBrowser(),
+                    MediaCookieSource.FromConfig(_config),
                     GetMediaProxy(),
                     _bilibili.ExportNetscapeCookies(),
                     cancellation.Token,
@@ -199,6 +211,7 @@ namespace LiveBoard
             var format = MediaQualityCombo.SelectedItem as MediaFormatOption;
             if (selectedAssets.Count == 1 && format != null)
                 selectedAssets[0].SelectedFormat = format;
+            EnsureBrowserCookiesReady();
             var cancellation = new CancellationTokenSource();
             _mediaCancellation = cancellation;
             var progressRunId = ++_mediaProgressRunId;
@@ -220,7 +233,7 @@ namespace LiveBoard
                     selectedAssets,
                     format,
                     directory,
-                    GetMediaCookieBrowser(),
+                    MediaCookieSource.FromConfig(_config),
                     GetMediaProxy(),
                     _bilibili.ExportNetscapeCookies(),
                     cancellation.Token,
@@ -364,10 +377,133 @@ namespace LiveBoard
             SaveConfig(null);
         }
 
+        /// <summary>
+        /// 选择浏览器作为登录来源时的前置说明。
+        /// 新版 Chromium 用 App-Bound 加密 Cookie，任何第三方进程都读不到登录态，
+        /// 因此这里只做解释与引导，不再承诺自动读取。
+        /// </summary>
+        private void EnsureBrowserCookiesReady()
+        {
+            var selected = MediaCookieCombo.SelectedItem as string;
+            if (!BrowserCookieService.IsBrowserLabel(selected) ||
+                string.Equals(BrowserCookieService.BrowserValue(selected), "firefox", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            if (!BrowserCookieService.HasAppBoundEncryptionKey(selected))
+                return;
+
+            SetMediaStatus("该浏览器的登录态无法被读取",
+                selected + " 已启用 App-Bound 加密：登录态只能由浏览器自己解密，任何工具都读不到。请用「导入 cookies.txt」",
+                "需要 cookies.txt", "!", FindBrush("OrangeBrush"));
+        }
+
         private void MediaCookie_OnChanged(object sender, SelectionChangedEventArgs e)
         {
+            UpdateMediaCookieHint();
             if (!_loadingControls && _config != null)
                 SaveConfig(null);
+        }
+
+        private void UpdateMediaCookieHint()
+        {
+            if (MediaCookieHintText == null || MediaCookieCombo == null)
+                return;
+
+            var selected = MediaCookieCombo.SelectedItem as string ?? BrowserCookieService.NoBrowserSource;
+            MediaCookieHintText.Foreground = FindBrush("MutedBrush");
+
+            if (string.Equals(selected, BrowserCookieService.CookieFileSource, StringComparison.OrdinalIgnoreCase))
+            {
+                string summary;
+                string error;
+                var path = _config == null ? null : _config.MediaCookieFile;
+                if (BrowserCookieService.TryDescribeCookieFile(path, out summary, out error))
+                    MediaCookieHintText.Text = "cookies.txt：" + summary + " · " + path;
+                else
+                    MediaCookieHintText.Text = error + " 点击「导入 cookies.txt」选择文件；没有文件时点「如何获取」。";
+                if (!string.IsNullOrWhiteSpace(error))
+                    MediaCookieHintText.Foreground = FindBrush("OrangeBrush");
+                return;
+            }
+
+            if (!BrowserCookieService.IsBrowserLabel(selected))
+            {
+                MediaCookieHintText.Text = "不使用登录状态；需要登录的站点（Instagram、X、YouTube 等）会解析失败，可改用 cookies.txt。";
+                return;
+            }
+
+            var report = BrowserCookieService.Inspect(selected);
+            MediaCookieHintText.Text = report.Detail;
+            if (!report.IsUsable)
+                MediaCookieHintText.Foreground = FindBrush("OrangeBrush");
+        }
+
+        private void SetMediaCookieSelection(string value)
+        {
+            if (MediaCookieCombo == null || string.IsNullOrWhiteSpace(value))
+                return;
+            if (!MediaCookieCombo.Items.Cast<object>().Any(item => string.Equals(item as string, value, StringComparison.OrdinalIgnoreCase)))
+                MediaCookieCombo.Items.Add(value);
+            MediaCookieCombo.SelectedItem = value;
+        }
+
+        private void MediaCookieFile_OnClick(object sender, RoutedEventArgs e)
+        {
+            if (_config == null)
+                return;
+            var dialog = new OpenFileDialog
+            {
+                Title = "选择 cookies.txt",
+                Filter = "Netscape Cookie 文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+                CheckFileExists = true
+            };
+            if (dialog.ShowDialog(this) != true)
+                return;
+
+            string summary;
+            string error;
+            if (!BrowserCookieService.TryDescribeCookieFile(dialog.FileName, out summary, out error))
+            {
+                SetMediaStatus("cookies.txt 无法使用", error, "导入失败", "!", FindBrush("OrangeBrush"));
+                return;
+            }
+
+            _config.MediaCookieFile = dialog.FileName;
+            SetMediaCookieSelection(BrowserCookieService.CookieFileSource);
+            SaveConfig(null);
+            UpdateMediaCookieHint();
+            SetMediaStatus("已导入 cookies.txt", summary, "登录来源", "✓", FindBrush("BrightGreenBrush"));
+        }
+
+        private void MediaCookieHelp_OnClick(object sender, RoutedEventArgs e)
+        {
+            var answer = MessageBox.Show(
+                "从浏览器导出登录态（一次性设置，约 1 分钟）：\n\n" +
+                "1. 在已登录目标站点的浏览器里安装扩展「Get cookies.txt LOCALLY」（Edge 可在 Edge 加载项里搜索同名扩展）。\n" +
+                "2. 打开要导出的站点页面，点击扩展图标，选择 Export。\n" +
+                "3. 回到 LiveBoard 点击「导入 cookies.txt」，选择刚导出的文件。\n\n" +
+                "说明：新版 Chrome / Edge 用 App-Bound 加密保护 Cookie，并且不允许其他程序读取；\n" +
+                "扩展是在浏览器内部读取，因此只有这种方式能拿到登录态。\n" +
+                "Firefox 的 Cookie 未加密，可直接在「登录来源」里选择。\n\n" +
+                "是否现在打开扩展商店页面？",
+                "如何导出 cookies.txt",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Information);
+            if (answer != MessageBoxResult.Yes)
+                return;
+
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "https://chromewebstore.google.com/search/get%20cookies.txt%20locally",
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                SetMediaStatus("无法打开浏览器", ShortenStatus(ex.Message), "打开失败", "!", FindBrush("OrangeBrush"));
+            }
         }
 
         private void MediaQuality_OnChanged(object sender, SelectionChangedEventArgs e)
@@ -447,7 +583,7 @@ namespace LiveBoard
 
         private string GetMediaCookieBrowser()
         {
-            return MediaCookieCombo.SelectedItem as string ?? "不使用浏览器登录";
+            return MediaCookieCombo.SelectedItem as string ?? BrowserCookieService.NoBrowserSource;
         }
 
         private void UpdateMediaBilibiliAccountUi()

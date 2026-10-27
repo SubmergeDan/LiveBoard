@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -53,6 +54,7 @@ namespace LiveBoard
     public sealed class BilibiliService
     {
         private CookieContainer _cookies = new CookieContainer();
+        private static int _requestCount;
 
         public bool IsLoggedIn { get; private set; }
         public string UserName { get; private set; }
@@ -404,6 +406,10 @@ namespace LiveBoard
 
         private async Task<IDictionary<string, object>> GetJsonAsync(string url, CancellationToken cancellationToken)
         {
+            // 只对最早几次请求做耗时诊断：首次请求的同步前缀（代理探测/TLS/证书链）
+            // 是启动卡顿的嫌疑点，需要精确到“建请求 / 收响应头 / 读响应体”。
+            var trace = Interlocked.Increment(ref _requestCount) <= 3;
+            var watch = trace ? Stopwatch.StartNew() : null;
             var request = (HttpWebRequest)WebRequest.Create(url);
             request.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
             request.Accept = "application/json, text/plain, */*";
@@ -412,14 +418,20 @@ namespace LiveBoard
             request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
             request.Timeout = 20000;
             request.ReadWriteTimeout = 20000;
+            if (trace)
+                StartupTrace.Mark("HTTP#" + _requestCount + " 请求对象已创建（" + watch.ElapsedMilliseconds + " ms）");
             try
             {
                 using (cancellationToken.Register(delegate { request.Abort(); }))
                 using (var response = (HttpWebResponse)await request.GetResponseAsync())
                 using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
                 {
+                    if (trace)
+                        StartupTrace.Mark("HTTP#" + _requestCount + " 已收到响应头（" + watch.ElapsedMilliseconds + " ms）");
                     var text = await reader.ReadToEndAsync();
                     cancellationToken.ThrowIfCancellationRequested();
+                    if (trace)
+                        StartupTrace.Mark("HTTP#" + _requestCount + " 响应体读取完成（" + watch.ElapsedMilliseconds + " ms，共 " + text.Length + " 字符）");
                     return AsDictionary(new JavaScriptSerializer().DeserializeObject(text));
                 }
             }

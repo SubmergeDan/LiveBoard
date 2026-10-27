@@ -39,6 +39,7 @@ namespace LiveBoard
             }
             _ownsSingleInstanceMutex = true;
             AppDomain.CurrentDomain.AssemblyResolve += ResolveEmbeddedAssembly;
+            StartupTrace.Mark("App.OnStartup 就绪");
             base.OnStartup(e);
         }
 

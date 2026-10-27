@@ -85,6 +85,8 @@
     <Compile Include="BilibiliService.cs" />
     <Compile Include="M4sMuxService.cs" />
     <Compile Include="MediaExportService.cs" />
+    <Compile Include="BrowserCookieService.cs" />
+    <Compile Include="StartupTrace.cs" />
     <Compile Include="MainWindow.MediaExport.cs">
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </Compile>

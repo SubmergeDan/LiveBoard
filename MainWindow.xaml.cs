@@ -73,6 +73,8 @@ namespace LiveBoard
         {
             _recorder = new RecordingService(_bilibili);
             InitializeComponent();
+            StartupTrace.Mark("InitializeComponent 完成（XAML 已构建）");
+            ContentRendered += MainWindow_ContentRendered;
             SourceInitialized += Window_OnSourceInitialized;
             Rooms = new ObservableCollection<RoomConfig>();
             DataContext = this;
@@ -105,11 +107,20 @@ namespace LiveBoard
             SegmentMinutesSlider.Value = 60;
             SegmentSizeBox.Text = "2048";
             InitializeMediaWorkspace();
+            StartupTrace.Mark("构造函数完成");
+        }
+
+        private void MainWindow_ContentRendered(object sender, EventArgs e)
+        {
+            StartupTrace.Mark("窗口已首次渲染完成（用户此刻已可交互）");
+            StartupTrace.Summary("首次渲染");
         }
 
         private async void Window_Loaded(object sender, RoutedEventArgs e)
         {
+            StartupTrace.Mark("Window_Loaded 开始");
             _config = _store.Load();
+            StartupTrace.Mark("配置已加载");
             _loadingControls = true;
             if (_store.LoadedFromBackup)
                 AddActivity("已恢复直播间配置", "主配置为空或不可读取，已自动恢复上一份备份");
@@ -117,7 +128,9 @@ namespace LiveBoard
                 AddActivity("已迁移直播间配置", "已从旧版 RecordingHelper 配置恢复");
             _bilibili.LoadProtectedCookies(_config.BilibiliCookieData);
             LoadMediaWorkspaceSettings();
+            StartupTrace.Mark("媒体导出设置已加载");
             ReplaceRooms(_config.Rooms);
+            StartupTrace.Mark("房间列表已恢复（" + Rooms.Count + " 个）");
             OutputPathBox.Text = _config.OutputDirectory;
             IntervalText.Text = _config.CheckIntervalSeconds + " 秒";
             PlatformCombo.SelectedItem = NormalizePlatform(_config.DefaultPlatform);
@@ -130,17 +143,29 @@ namespace LiveBoard
                 SaveConfig(null);
             UpdateBilibiliAccountUi();
             RefreshAllRoomQualityOptions(false);
+            StartupTrace.Mark("画质选项已刷新（第一次）");
             AddActivity("工作区已加载", "已恢复 " + Rooms.Count + " 个直播间配置");
             UpdateRoomSummary();
             LastSavedText.Text = " · 已从本机恢复";
             _monitorCancellation = new CancellationTokenSource();
             SetMonitorInterval(_config.CheckIntervalSeconds);
             _monitorTimer.Start();
-            await _bilibili.ValidateLoginAsync(_monitorCancellation.Token);
+            StartupTrace.Mark("监控定时器已启动");
+            // 先把窗口交给用户：完成渲染与首次布局之后再开始网络工作。
+            // 首次 HTTPS 请求的同步前缀（代理探测、TLS 握手、证书链校验）可能耗时数秒，
+            // 放在 UI 线程上会表现为“窗口已经出现但一段时间内点不动”。
+            await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+            StartupTrace.Mark("窗口已可交互");
+            // B 站登录态校验放到线程池：HttpWebRequest 的同步前缀绝不能占用 UI 线程。
+            await Task.Run(() => _bilibili.ValidateLoginAsync(_monitorCancellation.Token));
+            StartupTrace.Mark("B 站登录态校验完成");
             UpdateBilibiliAccountUi();
             RefreshAddQualityOptions(_config.DefaultQuality);
             RefreshAllRoomQualityOptions(false);
+            StartupTrace.Mark("画质选项已刷新（第二次）");
             await CheckAllRoomsAsync();
+            StartupTrace.Mark("首次房间检测完成");
+            StartupTrace.Summary("启动流程结束");
         }
 
         private async void AddRoom_OnClick(object sender, RoutedEventArgs e)
@@ -1512,7 +1537,9 @@ namespace LiveBoard
                 return;
             room.LiveStatus = "检测中";
             room.LiveStatusDetail = "正在请求直播状态";
-            RefreshRoomCards();
+            // 这里不再重建整张列表：LiveStatus 是绑定属性，会自行刷新卡片。
+            // 原先每次检测（启动时 16 个房间同时开始）都会 Items.Refresh() 一次，
+            // 等于在 UI 线程上连续重建数百个卡片，是启动卡顿的主因。
             try
             {
                 var result = await _recorder.ProbeAsync(room, _monitorCancellation.Token);
@@ -1566,7 +1593,6 @@ namespace LiveBoard
                 else if (qualitySelectionChanged)
                     SaveConfig(null);
                 UpdateSelectedRoomStatus();
-                RefreshRoomCards();
                 if (shouldAutoStop)
                 {
                     AddActivity("直播已结束", room.DisplayName + " · 已自动停止录制并封装文件");
@@ -1589,7 +1615,6 @@ namespace LiveBoard
                 room.LiveStatusDetail = ShortenStatus(ex.Message);
             }
             UpdateSelectedRoomStatus();
-            RefreshRoomCards();
             AddActivity("直播状态更新", room.DisplayName + " · " + room.RoomId + " · " + room.LiveStatus);
         }
 
@@ -1686,8 +1711,14 @@ namespace LiveBoard
 
         private void RefreshRoomCards()
         {
+            // 卡片完全依赖数据绑定（LiveStatus / RecordingStatus / QualityLabel 等），
+            // Items.Refresh() 会销毁并重建全部卡片，启动时被连续调用会造成明显卡顿，
+            // 因此这里记录耗时，便于定位。
+            var watch = Stopwatch.StartNew();
             RoomItems.Items.Refresh();
             UpdateRoomSummary();
+            watch.Stop();
+            StartupTrace.CountRoomCardRefresh(watch.Elapsed.TotalMilliseconds);
         }
 
         private void UpdateRoomSummary()
